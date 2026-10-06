@@ -1,0 +1,6 @@
+# Falsos positivos revisados a mano. Cada línea es la huella exacta de un hallazgo
+# (commit:archivo:regla:línea) — un cambio en esa línea vuelve a escanearse.
+
+# Firma deliberadamente INCORRECTA en un test: comprueba que el webhook rechaza (401) un
+# evento firmado con un secreto que no es el de la organización. No es una credencial.
+03d866153737069c06beebd4d848bee35b505a22:internal/app/whatsapp_webhook_test.go:generic-api-key:167

@@ -78,7 +78,7 @@ jobs:
       # Versión fijada. No se usa gitleaks-action: exige licencia en repos de
       # organización. La ruta del módulo sigue siendo la antigua (zricethezav).
       - name: gitleaks (historial completo)
-        run: go run github.com/zricethezav/gitleaks/v8@v8.30.1 git . --no-banner --redact
+        run: go run github.com/zricethezav/gitleaks/v8@v8.30.1 git . --no-banner --redact --verbose
 
   image:
     needs: quality
