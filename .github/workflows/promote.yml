@@ -43,7 +43,7 @@ jobs:
       SSH_USER: ${{ secrets.SSH_USER }}
       PUBLIC_URL: https://domicilia.com.co
     steps:
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
