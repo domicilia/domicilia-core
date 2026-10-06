@@ -1,0 +1,1938 @@
+openapi: 3.0.3
+info:
+  title: Domicilia Core API
+  version: 0.1.0
+  description: |
+    Contrato de la API de domicilia-core. Es la FUENTE DE VERDAD para cualquier cliente (el frontend, el agente de IA):
+    los clientes tipados se generan de este archivo.
+
+    Convenciones:
+    - Identificadores: UUID como texto.
+    - Errores: `application/problem+json` (RFC 9457) con `detail` y `request_id`.
+    - Listados que crecen (conversaciones, mensajes, contactos): paginación por CURSOR (`limit` + `cursor`); la respuesta
+      trae `next_cursor` (null en la última página). El cursor es opaco.
+    - Fechas: RFC 3339 en UTC.
+    - Cambios parciales (PATCH): un campo ausente no se toca; `null` deja el campo en blanco.
+
+    ESTADO: este contrato cubre por ahora el módulo de WhatsApp (bandejas, contactos, conversaciones y mensajes) y su
+    webhook, el módulo de catálogo (categorías, productos, variantes y modificadores), el de pedidos (carrito y su
+    máquina de estados), el de pagos (cobro por ePayco y su webhook) y el de promociones (cupones de descuento). El
+    resto de la API (usuarios, organizaciones, planes, roles) se documenta aparte; una prueba
+    verifica que lo documentado aquí es exactamente lo que el servidor sirve, y valida las respuestas reales contra
+    estos esquemas.
+servers:
+  - url: /
+security:
+  - bearerAuth: []
+tags:
+  - name: Catálogo
+    description: Menú de una organización — categorías, productos (con sus variantes) y grupos de modificadores.
+  - name: Carrito
+    description: |
+      El carrito de UN cliente en UNA organización — un pedido en estado draft. Quien lo arma no es miembro del
+      negocio: no exige ningún permiso de organización, solo que exista y esté activa.
+  - name: Mis pedidos
+    description: Pedidos ya confirmados de quien llama, sin importar de qué organización — cruza organizaciones a propósito.
+  - name: Pedidos
+    description: Gestión de los pedidos de una organización, del lado del negocio. Requiere org.orders.read / org.orders.manage.
+  - name: Pagos
+    description: Cobro de un pedido. ePayco es la única pasarela — ver docs/ecommerce.md §3. El webhook de confirmación vive fuera de este contrato (se autentica con la firma de la pasarela, no con JWT).
+  - name: Promociones
+    description: |
+      Cupones de descuento de una organización. El CRUD (crear/ver/listar/editar) es del negocio y requiere
+      org.promotions.read / org.promotions.manage. Aplicar o quitar un código del carrito propio es del cliente,
+      sin permiso de organización — mismas rutas que Carrito.
+  - name: Bandejas
+    description: Números de WhatsApp conectados a una organización. El token de Meta se guarda cifrado y NUNCA se devuelve.
+  - name: Contactos
+    description: Personas con las que la organización habla. Son por organización.
+  - name: Conversaciones
+    description: Bandeja de atención. Un texto libre solo puede enviarse dentro de las 24 h siguientes al último mensaje del cliente.
+  - name: Mensajes
+    description: Hilo de una conversación y envío de respuestas.
+  - name: Webhooks
+    description: Lo llama Meta, no un usuario. Se autentica con firma, no con JWT.
+
+paths:
+  /v1/organizations/{org_id}/categories:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+    get:
+      tags: [Catálogo]
+      operationId: listCategories
+      summary: Lista las categorías del menú
+      description: Requiere `org.catalog.read`. Incluye activas e inactivas — quien administra el menú necesita ver ambas para poder reactivar una.
+      responses:
+        '200':
+          description: Categorías
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Category' } }
+        default: { $ref: '#/components/responses/Problem' }
+    post:
+      tags: [Catálogo]
+      operationId: createCategory
+      summary: Crea una categoría
+      description: Requiere `org.catalog.manage`. El nombre es único por organización entre las activas.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateCategoryRequest' }
+      responses:
+        '201':
+          description: Categoría creada
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Category' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/categories/{category_id}:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/CategoryID'
+    patch:
+      tags: [Catálogo]
+      operationId: updateCategory
+      summary: Cambia una categoría (parcial)
+      description: Requiere `org.catalog.manage`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateCategoryRequest' }
+      responses:
+        '200':
+          description: Categoría actualizada
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Category' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/public/products:
+    get:
+      tags: [Catálogo]
+      operationId: publicProductFeed
+      summary: Feed de Inicio — productos de varias organizaciones a la vez
+      description: |
+        Sin sesión. Solo organizaciones activas y productos activos Y publicados a este canal (`channels` incluye
+        `"ecommerce"` — un producto no aparece aquí solo por existir, la organización tiene que publicarlo) con al
+        menos una variante activa (sin eso no hay nada que agregar al carrito). `category` filtra por el NOMBRE de
+        categoría (sin distinguir mayúsculas) — las categorías son por organización, no una taxonomía compartida,
+        así que es una coincidencia de texto, no un id. Para configurar un producto antes de agregarlo al carrito,
+        pedir su detalle completo (`GET /public/organizations/{org_id}/products/{product_id}`).
+      parameters:
+        - name: organization_id
+          in: query
+          description: Acota al menú de UN restaurante por id — lo usa su propia vitrina si ya lo conoce.
+          schema: { type: string, format: uuid }
+        - name: organization_slug
+          in: query
+          description: Lo mismo que organization_id, pero por slug — la vitrina de un restaurante solo conoce el slug de su URL.
+          schema: { type: string }
+        - name: q
+          in: query
+          schema: { type: string }
+        - name: category
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        '200':
+          description: Página del feed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FeedProductPage' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/public/organizations/{org_id}/products/{product_id}:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/ProductID'
+    get:
+      tags: [Catálogo]
+      operationId: publicGetProductDetail
+      summary: Detalle de un producto, para configurarlo antes de agregarlo al carrito
+      description: Sin sesión. La organización debe existir y estar activa; el producto, activo.
+      responses:
+        '200':
+          description: Producto con variantes y modificadores completos
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProductDetail' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/products:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+    get:
+      tags: [Catálogo]
+      operationId: listProducts
+      summary: Lista productos (paginado)
+      description: Requiere `org.catalog.read`.
+      parameters:
+        - name: category_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 30 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        '200':
+          description: Página de productos
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProductPage' }
+        default: { $ref: '#/components/responses/Problem' }
+    post:
+      tags: [Catálogo]
+      operationId: createProduct
+      summary: Crea un producto
+      description: |
+        Requiere `org.catalog.manage`. Exige al menos una variante (el precio vive ahí, nunca en el producto). Si
+        ninguna variante viene marcada `is_default`, se marca la primera automáticamente.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateProductRequest' }
+      responses:
+        '201':
+          description: Producto creado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Product' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/products/{product_id}:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/ProductID'
+    get:
+      tags: [Catálogo]
+      operationId: getProduct
+      summary: Lee un producto
+      description: Requiere `org.catalog.read`.
+      responses:
+        '200':
+          description: Producto
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Product' }
+        default: { $ref: '#/components/responses/Problem' }
+    patch:
+      tags: [Catálogo]
+      operationId: updateProduct
+      summary: Cambia un producto (parcial)
+      description: |
+        Requiere `org.catalog.manage`. `variants` y `modifier_group_ids` ausentes no se tocan; presentes (incluso
+        vacíos) REEMPLAZAN la lista completa: una variante existente que no venga en la lista nueva se desactiva —
+        nunca se borra, porque un pedido futuro podría referenciarla.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateProductRequest' }
+      responses:
+        '200':
+          description: Producto actualizado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Product' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/products/{product_id}/image:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/ProductID'
+    post:
+      tags: [Catálogo]
+      operationId: uploadProductImage
+      summary: Sube la foto de un producto
+      description: |
+        Requiere `org.catalog.manage`. El tipo real se detecta por el CONTENIDO del archivo (nunca por su nombre
+        ni por el Content-Type que mande el cliente): solo JPEG, PNG, WEBP o GIF, hasta 5 MB. Reemplaza cualquier
+        foto anterior. Responde 503 si este servidor no tiene el almacenamiento de fotos configurado
+        (CORE_MEDIA_STORAGE_ACCOUNT).
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [image]
+              properties:
+                image:
+                  type: string
+                  format: binary
+      responses:
+        '200':
+          description: Producto con la foto actualizada
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Product' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/modifier-groups:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+    get:
+      tags: [Catálogo]
+      operationId: listModifierGroups
+      summary: Lista los grupos de modificadores de la organización
+      description: Requiere `org.catalog.read`. No pagina — un menú real tiene pocas decenas de grupos como mucho.
+      responses:
+        '200':
+          description: Grupos de modificadores
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/ModifierGroup' } }
+        default: { $ref: '#/components/responses/Problem' }
+    post:
+      tags: [Catálogo]
+      operationId: createModifierGroup
+      summary: Crea un grupo de modificadores
+      description: Requiere `org.catalog.manage`. Se reutiliza entre productos (p. ej. "Extras de pizza" se define una vez).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateModifierGroupRequest' }
+      responses:
+        '201':
+          description: Grupo creado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModifierGroup' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/modifier-groups/{modifier_group_id}:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/ModifierGroupID'
+    get:
+      tags: [Catálogo]
+      operationId: getModifierGroup
+      summary: Lee un grupo de modificadores
+      description: Requiere `org.catalog.read`.
+      responses:
+        '200':
+          description: Grupo de modificadores
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModifierGroup' }
+        default: { $ref: '#/components/responses/Problem' }
+    patch:
+      tags: [Catálogo]
+      operationId: updateModifierGroup
+      summary: Cambia un grupo de modificadores (parcial)
+      description: 'Requiere `org.catalog.manage`. `options` sigue el mismo reemplazo-completo que `variants` de un producto.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateModifierGroupRequest' }
+      responses:
+        '200':
+          description: Grupo actualizado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModifierGroup' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/cart:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+    get:
+      tags: [Carrito]
+      operationId: getCart
+      summary: Ve el carrito propio en esta organización
+      description: Lo crea vacío si todavía no existe. Sin permiso de organización — cualquier cliente autenticado puede pedirle a un negocio activo.
+      responses:
+        '200':
+          description: Carrito
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/cart/items:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+    post:
+      tags: [Carrito]
+      operationId: addCartItem
+      summary: Agrega una línea al carrito
+      description: |
+        El nombre, el precio y los modificadores se resuelven SIEMPRE contra el catálogo real de la organización —
+        nunca contra lo que venga en la petición. Un grupo de modificadores obligatorio (min_select >= 1) que
+        aplique al producto y no reciba ninguna opción elegida es un 422, aunque el cliente no lo haya tocado.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AddCartItemRequest' }
+      responses:
+        '201':
+          description: Carrito con la línea agregada
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/cart/items/{item_id}:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/ItemID'
+    patch:
+      tags: [Carrito]
+      operationId: updateCartItemQuantity
+      summary: Cambia la cantidad de una línea
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateQuantityRequest' }
+      responses:
+        '200':
+          description: Carrito con la cantidad actualizada
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        default: { $ref: '#/components/responses/Problem' }
+    delete:
+      tags: [Carrito]
+      operationId: removeCartItem
+      summary: Quita una línea del carrito
+      responses:
+        '200':
+          description: Carrito sin esa línea
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/cart/place:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+    post:
+      tags: [Carrito]
+      operationId: placeCart
+      summary: Confirma el carrito
+      description: |
+        Congela nombre y precio de cada línea (nunca vuelven a cambiar, aunque el negocio edite su menú después) y
+        pasa el pedido a `placed`. Exige al menos una línea. Queda a la espera de pago — ver
+        `POST /organizations/{org_id}/orders/{order_id}/pay`.
+      responses:
+        '200':
+          description: Pedido confirmado (placed)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/cart/promotion:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+    post:
+      tags: [Promociones]
+      operationId: applyCartPromotion
+      summary: Aplica un código de descuento al carrito propio
+      description: |
+        Sin distinguir mayúsculas. Reemplaza cualquier código aplicado antes — aplicar OTRO código nunca los
+        acumula. Un código inválido, vencido, que no llegó a su fecha de inicio, que no alcanza el mínimo de
+        compra, o que ya agotó su límite de usos (total o por cliente), es 422. Un carrito vacío también es 422.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ApplyPromotionCodeRequest' }
+      responses:
+        '200':
+          description: Carrito con el descuento aplicado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        default: { $ref: '#/components/responses/Problem' }
+    delete:
+      tags: [Promociones]
+      operationId: removeCartPromotion
+      summary: Quita el código aplicado al carrito propio
+      description: Idempotente — quitarlo cuando no había ninguno no es un error.
+      responses:
+        '200':
+          description: Carrito sin descuento
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/carts/mine:
+    get:
+      tags: [Carrito]
+      operationId: listMyCarts
+      summary: Mis carritos abiertos, cruzando organizaciones
+      description: |
+        Un cliente puede tener un carrito abierto por restaurante a la vez (comprar en uno no reemplaza el
+        carrito de otro) — esto es lo que un indicador de carrito visible en cualquier ruta del cliente necesita.
+        Nunca incluye un carrito vacío. No pagina: a lo sumo un puñado de carritos abiertos por cliente.
+      responses:
+        '200':
+          description: Carritos abiertos
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/CartSummary' } }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/orders/mine:
+    get:
+      tags: [Mis pedidos]
+      operationId: listMyOrders
+      summary: Lista mis propios pedidos (los ya confirmados, cruzando organizaciones)
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 30 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        '200':
+          description: Página de pedidos
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderPage' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/orders/{order_id}:
+    parameters:
+      - $ref: '#/components/parameters/OrderID'
+    get:
+      tags: [Mis pedidos]
+      operationId: getMyOrder
+      summary: Lee uno de mis propios pedidos
+      description: El de otro cliente, o el carrito (draft) de cualquiera, responde 404 — no 403, para no revelar que el id existe.
+      responses:
+        '200':
+          description: Pedido
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/orders/{order_id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/OrderID'
+    post:
+      tags: [Mis pedidos]
+      operationId: cancelMyOrder
+      summary: Cancela uno de mis propios pedidos
+      description: Solo si su estado todavía lo permite (antes de `preparing`) — si no, 409.
+      responses:
+        '200':
+          description: Pedido cancelado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/orders/{order_id}/retry-payment:
+    parameters:
+      - $ref: '#/components/parameters/OrderID'
+    post:
+      tags: [Mis pedidos]
+      operationId: retryOrderPayment
+      summary: Reintenta el pago de un pedido con el pago fallido
+      description: Vuelve el pedido a `placed`, sobre el MISMO pedido — nunca crea uno nuevo. Después, `POST .../pay` inicia un cobro nuevo.
+      responses:
+        '200':
+          description: Pedido de vuelta en placed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/orders:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+    get:
+      tags: [Pedidos]
+      operationId: listOrders
+      summary: Lista los pedidos de la organización (paginado)
+      description: Requiere `org.orders.read`. Nunca incluye carritos (draft) de clientes — solo lo ya confirmado.
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string, enum: [placed, confirmed, payment_failed, accepted, rejected, preparing, out_for_delivery, delivered, cancelled] }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 30 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        '200':
+          description: Página de pedidos
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderPage' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/orders/{order_id}:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/OrderID'
+    get:
+      tags: [Pedidos]
+      operationId: getOrder
+      summary: Lee un pedido de la organización
+      description: Requiere `org.orders.read`.
+      responses:
+        '200':
+          description: Pedido
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/orders/{order_id}/accept:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/OrderID'
+    post:
+      tags: [Pedidos]
+      operationId: acceptOrder
+      summary: Acepta un pedido pagado (confirmed → accepted)
+      description: Requiere `org.orders.manage`.
+      responses:
+        '200':
+          description: Pedido aceptado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/orders/{order_id}/reject:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/OrderID'
+    post:
+      tags: [Pedidos]
+      operationId: rejectOrder
+      summary: Rechaza un pedido pagado (confirmed → rejected)
+      description: Requiere `org.orders.manage`.
+      responses:
+        '200':
+          description: Pedido rechazado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/orders/{order_id}/start-preparing:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/OrderID'
+    post:
+      tags: [Pedidos]
+      operationId: startPreparingOrder
+      summary: Marca un pedido aceptado en preparación (accepted → preparing)
+      description: Requiere `org.orders.manage`.
+      responses:
+        '200':
+          description: Pedido en preparación
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/orders/{order_id}/dispatch:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/OrderID'
+    post:
+      tags: [Pedidos]
+      operationId: dispatchOrder
+      summary: Despacha un pedido (preparing → out_for_delivery)
+      description: Requiere `org.orders.manage`.
+      responses:
+        '200':
+          description: Pedido despachado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/orders/{order_id}/mark-delivered:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/OrderID'
+    post:
+      tags: [Pedidos]
+      operationId: markOrderDelivered
+      summary: Marca un pedido entregado (out_for_delivery → delivered)
+      description: Requiere `org.orders.manage`.
+      responses:
+        '200':
+          description: Pedido entregado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/orders/{order_id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/OrderID'
+    post:
+      tags: [Pedidos]
+      operationId: cancelOrder
+      summary: Cancela un pedido desde el negocio
+      description: Requiere `org.orders.manage`. Solo antes de `preparing` — si no, 409.
+      responses:
+        '200':
+          description: Pedido cancelado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/orders/{order_id}/pay:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/OrderID'
+    post:
+      tags: [Pagos]
+      operationId: payOrder
+      summary: Inicia el cobro de un pedido propio
+      description: |
+        Requiere que el pedido sea propio (mismo criterio que Mis pedidos, no un permiso de organización) y que
+        esté `placed` (recién confirmado, o de vuelta ahí por `retry-payment`) — si no, 409. Responde 503 si el
+        servidor no tiene una pasarela de pago configurada.
+      responses:
+        '201':
+          description: Cobro iniciado, con la URL a la que mandar al cliente a pagar
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/orders/{order_id}/payments:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/OrderID'
+    get:
+      tags: [Pagos]
+      operationId: listOrderPayments
+      summary: Lista los intentos de cobro de un pedido
+      description: |
+        Requiere `org.payments.read` — no delegable, es información contable. Puede haber más de un intento si el
+        primero falló y el cliente reintentó (`retry-payment` + `pay` de nuevo). No pagina.
+      responses:
+        '200':
+          description: Intentos de cobro
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Payment' } }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/promotions:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+    get:
+      tags: [Promociones]
+      operationId: listPromotions
+      summary: Lista los cupones de la organización
+      description: Requiere `org.promotions.read`. Incluye los desactivados — nunca se borran.
+      responses:
+        '200':
+          description: Cupones
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Promotion' } }
+        default: { $ref: '#/components/responses/Problem' }
+    post:
+      tags: [Promociones]
+      operationId: createPromotion
+      summary: Crea un cupón
+      description: Requiere `org.promotions.manage`. El código es único por organización entre los activos (sin distinguir mayúsculas) — un 409 si ya existe uno igual.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NewPromotionRequest' }
+      responses:
+        '201':
+          description: Cupón creado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Promotion' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/promotions/{promotion_id}:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/PromotionID'
+    get:
+      tags: [Promociones]
+      operationId: getPromotion
+      summary: Lee un cupón de la organización
+      description: Requiere `org.promotions.read`.
+      responses:
+        '200':
+          description: Cupón
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Promotion' }
+        default: { $ref: '#/components/responses/Problem' }
+    patch:
+      tags: [Promociones]
+      operationId: updatePromotion
+      summary: Edita un cupón
+      description: Requiere `org.promotions.manage`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdatePromotionRequest' }
+      responses:
+        '200':
+          description: Cupón actualizado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Promotion' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/inboxes:
+    get:
+      tags: [Bandejas]
+      operationId: listInboxes
+      summary: Lista las bandejas de la organización
+      description: Requiere `org.inbox.read`. Las archivadas solo las ve quien tiene `org.inbox.manage` y las pide con `include_archived=true`.
+      parameters:
+        - $ref: '#/components/parameters/OrgID'
+        - name: include_archived
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Bandejas
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Inbox' } }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/inboxes/whatsapp:
+    post:
+      tags: [Bandejas]
+      operationId: connectWhatsAppInbox
+      summary: Conecta un número de WhatsApp
+      description: |
+        Requiere `org.inbox.manage`. Valida las credenciales CONTRA Meta antes de guardar nada: el número debe pertenecer a la
+        cuenta y el token debe poder verlo. La primera bandeja es del plan base; más de una exige la función `multi_inbox` (402).
+        Responde 503 si el servidor no tiene configurado el cifrado de secretos.
+      parameters:
+        - $ref: '#/components/parameters/OrgID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConnectWhatsAppRequest' }
+      responses:
+        '201':
+          description: Bandeja conectada
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Inbox' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/inboxes/{inbox_id}:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/InboxID'
+    get:
+      tags: [Bandejas]
+      operationId: getInbox
+      summary: Lee una bandeja
+      responses:
+        '200':
+          description: Bandeja
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Inbox' }
+        default: { $ref: '#/components/responses/Problem' }
+    patch:
+      tags: [Bandejas]
+      operationId: renameInbox
+      summary: Cambia el nombre de la bandeja
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RenameInboxRequest' }
+      responses:
+        '200':
+          description: Bandeja actualizada
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Inbox' }
+        default: { $ref: '#/components/responses/Problem' }
+    delete:
+      tags: [Bandejas]
+      operationId: archiveInbox
+      summary: Desconecta la bandeja
+      description: Archiva la bandeja y libera el número (se puede reconectar). Las conversaciones se conservan.
+      responses:
+        '204': { description: Desconectada }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/inboxes/{inbox_id}/credentials:
+    put:
+      tags: [Bandejas]
+      operationId: rotateInboxToken
+      summary: Cambia el token de Meta de la bandeja
+      description: Se valida contra Meta con el mismo número antes de reemplazar el guardado. Reactiva un canal en `needs_reauth`.
+      parameters:
+        - $ref: '#/components/parameters/OrgID'
+        - $ref: '#/components/parameters/InboxID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RotateCredentialsRequest' }
+      responses:
+        '200':
+          description: Bandeja con el canal reactivado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Inbox' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/inboxes/{inbox_id}/refresh:
+    post:
+      tags: [Bandejas]
+      operationId: refreshInbox
+      summary: Vuelve a leer de Meta los datos del número
+      description: Actualiza calidad y nivel de mensajería. Si Meta rechaza el token, el canal pasa a `needs_reauth`.
+      parameters:
+        - $ref: '#/components/parameters/OrgID'
+        - $ref: '#/components/parameters/InboxID'
+      responses:
+        '200':
+          description: Bandeja actualizada
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Inbox' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/contacts:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+    get:
+      tags: [Contactos]
+      operationId: listContacts
+      summary: Lista contactos (los más nuevos primero)
+      parameters:
+        - name: q
+          in: query
+          description: Busca en nombre, teléfono y correo. Los comodines `%` y `_` se toman literales.
+          schema: { type: string }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Página de contactos
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ContactPage' }
+        default: { $ref: '#/components/responses/Problem' }
+    post:
+      tags: [Contactos]
+      operationId: createContact
+      summary: Crea un contacto
+      description: El teléfono debe traer el código de país y es único por organización.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateContactRequest' }
+      responses:
+        '201':
+          description: Contacto creado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Contact' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/contacts/{contact_id}:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/ContactID'
+    get:
+      tags: [Contactos]
+      operationId: getContact
+      summary: Lee un contacto
+      responses:
+        '200':
+          description: Contacto
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Contact' }
+        default: { $ref: '#/components/responses/Problem' }
+    patch:
+      tags: [Contactos]
+      operationId: updateContact
+      summary: Cambia un contacto (parcial)
+      description: 'El teléfono no se edita: es la identidad del contacto.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateContactRequest' }
+      responses:
+        '200':
+          description: Contacto actualizado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Contact' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/conversations:
+    get:
+      tags: [Conversaciones]
+      operationId: listConversations
+      summary: Lista conversaciones (la de actividad más reciente primero)
+      parameters:
+        - $ref: '#/components/parameters/OrgID'
+        - name: inbox_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: status
+          in: query
+          description: Por omisión `open`.
+          schema: { type: string, enum: [open, pending, resolved, snoozed, all], default: open }
+        - name: assignee
+          in: query
+          description: '`all` (por omisión), `me`, `unassigned` o el id de un usuario.'
+          schema: { type: string, default: all }
+        - name: q
+          in: query
+          description: Busca en nombre y teléfono del contacto.
+          schema: { type: string }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Página de conversaciones
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationPage' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/conversations/counts:
+    get:
+      tags: [Conversaciones]
+      operationId: countConversations
+      summary: Contadores de las pestañas de la bandeja
+      parameters:
+        - $ref: '#/components/parameters/OrgID'
+        - name: inbox_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: status
+          in: query
+          schema: { type: string, enum: [open, pending, resolved, snoozed, all], default: open }
+      responses:
+        '200':
+          description: Contadores
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationTabs' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/conversations/{conversation_id}:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/ConversationID'
+    get:
+      tags: [Conversaciones]
+      operationId: getConversation
+      summary: Lee una conversación
+      responses:
+        '200':
+          description: Conversación
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Conversation' }
+        default: { $ref: '#/components/responses/Problem' }
+    patch:
+      tags: [Conversaciones]
+      operationId: updateConversation
+      summary: Cambia estado, prioridad, responsable o quién la atiende
+      description: |
+        Requiere `org.inbox.reply`. `status=snoozed` exige `snoozed_until` futuro; `snoozed_until` solo se envía con ese estado.
+        Solo se asigna a quien puede atender la bandeja de la organización. Reabrir una conversación resuelta responde 409 si el
+        contacto ya tiene otra abierta.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateConversationRequest' }
+      responses:
+        '200':
+          description: Conversación actualizada
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Conversation' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/conversations/{conversation_id}/read:
+    post:
+      tags: [Conversaciones]
+      operationId: markConversationRead
+      summary: Pone en cero los mensajes sin leer
+      parameters:
+        - $ref: '#/components/parameters/OrgID'
+        - $ref: '#/components/parameters/ConversationID'
+      responses:
+        '204': { description: Marcada como leída }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /v1/organizations/{org_id}/conversations/{conversation_id}/messages:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/ConversationID'
+    get:
+      tags: [Mensajes]
+      operationId: listMessages
+      summary: Hilo de la conversación (del más nuevo al más viejo)
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Página de mensajes
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessagePage' }
+        default: { $ref: '#/components/responses/Problem' }
+    post:
+      tags: [Mensajes]
+      operationId: sendMessage
+      summary: Responde con un texto
+      description: |
+        Requiere `org.inbox.reply` y la función `inbox_24h` del plan (402). El mensaje se ENCOLA (`status=queued`) y un
+        trabajador lo entrega a Meta: la respuesta no espera a Meta. Responde 409 —con el motivo al inicio de `detail`:
+        `window_closed`, `contact_blocked` o `inbox_disconnected`— si ahora no se puede responder con texto libre
+        (`Conversation.can_reply` y `reply_block_reason` lo anticipan).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SendMessageRequest' }
+      responses:
+        '202':
+          description: Mensaje encolado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Message' }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /webhooks/whatsapp:
+    get:
+      tags: [Webhooks]
+      operationId: verifyWhatsAppWebhook
+      summary: Desafío de suscripción de Meta
+      description: Responde el desafío (`hub.challenge`) si el token de verificación coincide; 403 si no; 503 si el servidor no lo tiene configurado.
+      security: []
+      parameters:
+        - { name: hub.mode, in: query, schema: { type: string } }
+        - { name: hub.verify_token, in: query, schema: { type: string } }
+        - { name: hub.challenge, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: El desafío, tal cual
+          content:
+            text/plain:
+              schema: { type: string }
+        default: { $ref: '#/components/responses/Problem' }
+    post:
+      tags: [Webhooks]
+      operationId: receiveWhatsAppWebhook
+      summary: Eventos de Meta (mensajes y estados de entrega)
+      description: |
+        Se autentica con la cabecera `X-Hub-Signature-256` (HMAC-SHA256 del cuerpo exacto). Cada evento se autoriza con la
+        firma que corresponde a SU número. Es idempotente: una reentrega no se procesa dos veces. Responde 200 solo si quedó
+        procesado; ante un error nuestro responde 5xx para que Meta reintente.
+      security: []
+      parameters:
+        - name: X-Hub-Signature-256
+          in: header
+          required: true
+          schema: { type: string, example: 'sha256=3b1c...' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '200': { description: Procesado }
+        default: { $ref: '#/components/responses/Problem' }
+
+  /webhooks/payments:
+    post:
+      tags: [Webhooks]
+      operationId: receivePaymentWebhook
+      summary: Confirmación de la pasarela de pago (ePayco)
+      description: |
+        Form-encoded, no JSON — así es como ePayco entrega su confirmación. Se autentica con `x_signature`
+        (SHA-256 sobre los campos de la transacción con la llave privada del comercio, ver internal/epayco), no con
+        un JWT ni una cabecera. Idempotente por `x_ref_payco` + `x_transaction_id`: una reentrega no se procesa dos
+        veces. Responde 200 solo si quedó procesado (o ya lo estaba); ante un error nuestro responde 5xx para que
+        la pasarela reintente. 503 si el servidor no tiene una pasarela configurada.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              additionalProperties: true
+              description: 'x_ref_payco, x_transaction_id, x_id_invoice, x_amount, x_currency_code, x_transaction_state, x_signature, entre otros.'
+      responses:
+        '200': { description: Procesado (o ya lo estaba) }
+        default: { $ref: '#/components/responses/Problem' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT de auth-domicilia (GoTrue).
+
+  parameters:
+    OrgID:
+      name: org_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    InboxID:
+      name: inbox_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ContactID:
+      name: contact_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ConversationID:
+      name: conversation_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    CategoryID:
+      name: category_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ProductID:
+      name: product_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ModifierGroupID:
+      name: modifier_group_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ItemID:
+      name: item_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    OrderID:
+      name: order_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    PromotionID:
+      name: promotion_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Limit:
+      name: limit
+      in: query
+      description: Filas por página (1 a 100, por omisión 30).
+      schema: { type: integer, minimum: 1, maximum: 100, default: 30 }
+    Cursor:
+      name: cursor
+      in: query
+      description: Valor de `next_cursor` de la página anterior.
+      schema: { type: string }
+
+  responses:
+    Problem:
+      description: |
+        Error. Códigos habituales: 401 sin credenciales; 402 el plan no incluye la función; 403 sin permiso o organización
+        suspendida; 404 no existe (o archivada); 409 choca con el estado actual; 422 entrada inválida; 502 falló Meta;
+        503 función sin configurar.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status]
+      properties:
+        type: { type: string, example: 'about:blank' }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        request_id: { type: string }
+
+    Category:
+      type: object
+      required: [id, organization_id, name, position, is_active, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        organization_id: { type: string, format: uuid }
+        name: { type: string }
+        position: { type: integer }
+        is_active: { type: boolean }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    CreateCategoryRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        position: { type: integer, default: 0 }
+
+    UpdateCategoryRequest:
+      type: object
+      description: Un campo ausente no se toca. Ningún campo admite null.
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        position: { type: integer }
+        is_active: { type: boolean }
+
+    Variant:
+      type: object
+      description: Una versión comprable de un producto (un tamaño). El precio vive aquí, nunca en el producto.
+      required: [id, name, price_cents, is_default, is_active, position]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        price_cents: { type: integer, minimum: 0, description: 'En centavos de la moneda de la organización.' }
+        is_default: { type: boolean, description: La que se preselecciona al pedir. }
+        is_active: { type: boolean }
+        position: { type: integer }
+
+    VariantInput:
+      type: object
+      description: Id ausente crea una variante nueva; id presente actualiza la existente (debe ser del mismo producto).
+      required: [name, price_cents]
+      properties:
+        id: { type: string, format: uuid, nullable: true }
+        name: { type: string, minLength: 1, maxLength: 100 }
+        price_cents: { type: integer, minimum: 0, maximum: 100000000 }
+        is_default: { type: boolean, default: false }
+
+    Product:
+      type: object
+      required: [id, organization_id, category_id, name, description, image_url, position, is_active, variants, modifier_group_ids, ingredients, channels, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        organization_id: { type: string, format: uuid }
+        category_id: { type: string, format: uuid, nullable: true }
+        name: { type: string }
+        description: { type: string, nullable: true }
+        image_url: { type: string, nullable: true }
+        position: { type: integer }
+        is_active: { type: boolean }
+        variants: { type: array, items: { $ref: '#/components/schemas/Variant' } }
+        modifier_group_ids: { type: array, items: { type: string, format: uuid } }
+        ingredients: { type: array, items: { type: string }, description: 'Texto libre de la organización, sin validar contra nada.' }
+        channels:
+          type: array
+          items: { type: string, enum: [ecommerce, whatsapp] }
+          description: 'Dónde se publica. Vacío por omisión: un producto nuevo NO aparece en el feed público solo por estar activo — hay que publicarlo a propósito.'
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    CreateProductRequest:
+      type: object
+      description: 'Exige al menos una variante: el precio vive ahí, nunca en el producto. Sin channels, el producto se crea sin publicar en ningún lado.'
+      required: [name, variants]
+      properties:
+        category_id: { type: string, format: uuid, nullable: true }
+        name: { type: string, minLength: 1, maxLength: 150 }
+        description: { type: string, maxLength: 1000, nullable: true }
+        image_url: { type: string, nullable: true }
+        position: { type: integer, default: 0 }
+        variants: { type: array, minItems: 1, maxItems: 30, items: { $ref: '#/components/schemas/VariantInput' } }
+        modifier_group_ids: { type: array, maxItems: 20, items: { type: string, format: uuid } }
+        ingredients: { type: array, maxItems: 50, items: { type: string, maxLength: 60 } }
+        channels: { type: array, items: { type: string, enum: [ecommerce, whatsapp] } }
+
+    UpdateProductRequest:
+      type: object
+      description: |
+        Un campo ausente no se toca. En `category_id`, `description` e `image_url`, `null` explícito lo deja en
+        blanco. `variants`, `modifier_group_ids`, `ingredients` y `channels` ausentes no se tocan; presentes
+        (incluso `[]`) REEMPLAZAN la lista completa — una variante que no venga se desactiva, nunca se borra;
+        `channels: []` despublica el producto de todos los canales sin desactivarlo.
+      properties:
+        category_id: { type: string, format: uuid, nullable: true }
+        name: { type: string, minLength: 1, maxLength: 150 }
+        description: { type: string, maxLength: 1000, nullable: true }
+        image_url: { type: string, nullable: true }
+        position: { type: integer }
+        is_active: { type: boolean }
+        variants: { type: array, maxItems: 30, items: { $ref: '#/components/schemas/VariantInput' } }
+        modifier_group_ids: { type: array, maxItems: 20, items: { type: string, format: uuid } }
+        ingredients: { type: array, maxItems: 50, items: { type: string, maxLength: 60 } }
+        channels: { type: array, items: { type: string, enum: [ecommerce, whatsapp] } }
+
+    ProductPage:
+      type: object
+      required: [items, total, limit, offset]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Product' } }
+        total: { type: integer }
+        limit: { type: integer }
+        offset: { type: integer }
+
+    FeedProduct:
+      type: object
+      description: |
+        Un producto tal como aparece en el feed público de Inicio (varias organizaciones a la vez). Liviano a
+        propósito: para configurarlo y agregarlo al carrito, pedir el detalle completo
+        (GET /public/organizations/{org_id}/products/{product_id}).
+      required: [id, organization_id, organization_name, organization_slug, organization_logo_url, category_id, category_name, name, description, image_url, min_price_cents]
+      properties:
+        id: { type: string, format: uuid }
+        organization_id: { type: string, format: uuid }
+        organization_name: { type: string }
+        organization_slug: { type: string }
+        organization_logo_url: { type: string, nullable: true }
+        category_id: { type: string, format: uuid, nullable: true }
+        category_name: { type: string, nullable: true }
+        name: { type: string }
+        description: { type: string, nullable: true }
+        image_url: { type: string, nullable: true }
+        min_price_cents: { type: integer, description: Precio de la variante activa más barata — "desde $X" en la tarjeta. }
+
+    FeedProductPage:
+      type: object
+      required: [items, total, limit, offset]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/FeedProduct' } }
+        total: { type: integer }
+        limit: { type: integer }
+        offset: { type: integer }
+
+    ProductDetail:
+      type: object
+      description: Un producto con sus variantes y grupos de modificadores completos — lo que hace falta para configurarlo antes de agregarlo al carrito.
+      allOf:
+        - $ref: '#/components/schemas/Product'
+        - type: object
+          required: [modifier_groups]
+          properties:
+            modifier_groups: { type: array, items: { $ref: '#/components/schemas/ModifierGroup' } }
+
+    CartSummary:
+      type: object
+      description: Un carrito abierto del cliente en una organización — nunca uno vacío.
+      required: [order_id, organization_id, organization_name, organization_slug, item_count, total_cents, updated_at]
+      properties:
+        order_id: { type: string, format: uuid }
+        organization_id: { type: string, format: uuid }
+        organization_name: { type: string }
+        organization_slug: { type: string }
+        item_count: { type: integer }
+        total_cents: { type: integer }
+        updated_at: { type: string, format: date-time }
+
+    ModifierOption:
+      type: object
+      required: [id, name, price_delta_cents, is_active, position]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        price_delta_cents: { type: integer, minimum: 0 }
+        is_active: { type: boolean }
+        position: { type: integer }
+
+    OptionInput:
+      type: object
+      required: [name, price_delta_cents]
+      properties:
+        id: { type: string, format: uuid, nullable: true }
+        name: { type: string, minLength: 1, maxLength: 100 }
+        price_delta_cents: { type: integer, minimum: 0, maximum: 100000000 }
+
+    ModifierGroup:
+      type: object
+      description: 'Se reutiliza entre productos. min_select >= 1 es lo que hace al grupo obligatorio — no hay un campo "required" aparte.'
+      required: [id, organization_id, name, selection_type, min_select, max_select, is_active, options, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        organization_id: { type: string, format: uuid }
+        name: { type: string }
+        selection_type: { type: string, enum: [single, multiple] }
+        min_select: { type: integer, minimum: 0 }
+        max_select: { type: integer, minimum: 1 }
+        is_active: { type: boolean }
+        options: { type: array, items: { $ref: '#/components/schemas/ModifierOption' } }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    CreateModifierGroupRequest:
+      type: object
+      required: [name, selection_type, options]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        selection_type: { type: string, enum: [single, multiple] }
+        min_select: { type: integer, minimum: 0, default: 0 }
+        max_select: { type: integer, minimum: 1, default: 1 }
+        options: { type: array, minItems: 1, maxItems: 50, items: { $ref: '#/components/schemas/OptionInput' } }
+
+    UpdateModifierGroupRequest:
+      type: object
+      description: |
+        Un campo ausente no se toca. `selection_type`/`min_select`/`max_select` se validan juntos contra los valores
+        vigentes (cambiar solo uno podría dejar la combinación inconsistente). `options` ausente no se toca; presente
+        (incluso `[]`) REEMPLAZA la lista completa.
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        selection_type: { type: string, enum: [single, multiple] }
+        min_select: { type: integer, minimum: 0 }
+        max_select: { type: integer, minimum: 1 }
+        is_active: { type: boolean }
+        options: { type: array, maxItems: 50, items: { $ref: '#/components/schemas/OptionInput' } }
+
+    OrderModifierSnapshot:
+      type: object
+      description: Una opción de modificador elegida, con su precio EN EL MOMENTO del pedido — no cambia si el catálogo cambia después.
+      required: [modifier_group_id, modifier_group_name, option_id, option_name, price_delta_cents]
+      properties:
+        modifier_group_id: { type: string, format: uuid }
+        modifier_group_name: { type: string }
+        option_id: { type: string, format: uuid }
+        option_name: { type: string }
+        price_delta_cents: { type: integer }
+
+    OrderItem:
+      type: object
+      description: 'Nombre y precio son un SNAPSHOT: se congelan al confirmar el carrito y no cambian aunque el negocio edite su menú después.'
+      required: [id, product_variant_id, name, unit_price_cents, modifiers, unit_total_cents, quantity, line_total_cents, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        product_variant_id: { type: string, format: uuid, nullable: true }
+        name: { type: string }
+        unit_price_cents: { type: integer, description: 'Precio de la variante sola, sin modificadores.' }
+        modifiers: { type: array, items: { $ref: '#/components/schemas/OrderModifierSnapshot' } }
+        unit_total_cents: { type: integer, description: unit_price_cents + la suma de los modificadores elegidos. }
+        quantity: { type: integer, minimum: 1, maximum: 50 }
+        line_total_cents: { type: integer, description: unit_total_cents * quantity. }
+        created_at: { type: string, format: date-time }
+
+    Order:
+      type: object
+      description: |
+        Mientras status es `draft`, ES el carrito. Ver docs/ecommerce.md §2.1 para la máquina de estados completa.
+      required: [id, organization_id, customer_id, status, items, subtotal_cents, discount_cents, delivery_fee_cents, total_cents, promotion_id, placed_at, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        organization_id: { type: string, format: uuid }
+        customer_id: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [draft, placed, confirmed, payment_failed, accepted, rejected, preparing, out_for_delivery, delivered, cancelled]
+        items: { type: array, items: { $ref: '#/components/schemas/OrderItem' } }
+        subtotal_cents: { type: integer }
+        discount_cents: { type: integer, description: El descuento del cupón aplicado (promotion_id) — 0 si no hay ninguno. }
+        delivery_fee_cents: { type: integer, description: Siempre 0 hasta que exista el cálculo de envío. }
+        total_cents: { type: integer }
+        promotion_id: { type: string, format: uuid, nullable: true, description: 'El cupón aplicado al carrito, si hay uno. Se borra solo en cuanto el carrito vuelve a editarse.' }
+        placed_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    OrderPage:
+      type: object
+      required: [items, total, limit, offset]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Order' } }
+        total: { type: integer }
+        limit: { type: integer }
+        offset: { type: integer }
+
+    Payment:
+      type: object
+      description: Un intento de cobro de un pedido. Puede haber más de uno por pedido si el primero falló.
+      required: [id, order_id, organization_id, status, amount_cents, currency, gateway, checkout_url, failure_reason, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        order_id: { type: string, format: uuid }
+        organization_id: { type: string, format: uuid }
+        status: { type: string, enum: [pending, succeeded, failed] }
+        amount_cents: { type: integer }
+        currency: { type: string, example: COP }
+        gateway: { type: string, enum: [epayco] }
+        checkout_url: { type: string, nullable: true, description: 'Adonde se mandó al cliente a pagar. Null hasta que se arma (no debería tardar).' }
+        failure_reason: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    AddCartItemRequest:
+      type: object
+      required: [product_id, variant_id, quantity]
+      properties:
+        product_id: { type: string, format: uuid }
+        variant_id: { type: string, format: uuid }
+        quantity: { type: integer, minimum: 1, maximum: 50, default: 1 }
+        option_ids:
+          type: array
+          maxItems: 50
+          items: { type: string, format: uuid }
+          description: Opciones de modificador elegidas, de cualquier grupo que aplique al producto.
+
+    UpdateQuantityRequest:
+      type: object
+      required: [quantity]
+      properties:
+        quantity: { type: integer, minimum: 1, maximum: 50 }
+
+    Promotion:
+      type: object
+      description: Un cupón de descuento de la organización. Nunca se borra, solo se desactiva (is_active).
+      required: [id, organization_id, code, discount_type, value, min_order_cents, starts_at, ends_at, max_uses, per_customer_limit, is_active, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        organization_id: { type: string, format: uuid }
+        code: { type: string, description: Sin distinguir mayúsculas — se guarda en mayúsculas. }
+        discount_type: { type: string, enum: [percent, fixed] }
+        value: { type: integer, description: 'percent: 1-100. fixed: centavos, mayor que 0.' }
+        min_order_cents: { type: integer, description: Subtotal mínimo del carrito para poder usar el código. }
+        starts_at: { type: string, format: date-time, nullable: true }
+        ends_at: { type: string, format: date-time, nullable: true }
+        max_uses: { type: integer, nullable: true, description: 'Usos totales permitidos, contra pedidos ya confirmados (nunca contra carritos). Null es sin límite.' }
+        per_customer_limit: { type: integer, nullable: true, description: Usos permitidos por cliente. Null es sin límite. }
+        is_active: { type: boolean }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    NewPromotionRequest:
+      type: object
+      required: [code, discount_type, value]
+      properties:
+        code: { type: string, minLength: 1, maxLength: 40 }
+        discount_type: { type: string, enum: [percent, fixed] }
+        value: { type: integer }
+        min_order_cents: { type: integer, default: 0 }
+        starts_at: { type: string, format: date-time, nullable: true }
+        ends_at: { type: string, format: date-time, nullable: true }
+        max_uses: { type: integer, nullable: true }
+        per_customer_limit: { type: integer, nullable: true }
+
+    UpdatePromotionRequest:
+      type: object
+      description: Cambio parcial. code, discount_type, value y min_order_cents nunca se ponen en blanco (un ausente basta). starts_at, ends_at, max_uses y per_customer_limit sí admiten null ("sin fecha", "sin límite").
+      properties:
+        code: { type: string, minLength: 1, maxLength: 40 }
+        discount_type: { type: string, enum: [percent, fixed] }
+        value: { type: integer }
+        min_order_cents: { type: integer }
+        starts_at: { type: string, format: date-time, nullable: true }
+        ends_at: { type: string, format: date-time, nullable: true }
+        max_uses: { type: integer, nullable: true }
+        per_customer_limit: { type: integer, nullable: true }
+        is_active: { type: boolean }
+
+    ApplyPromotionCodeRequest:
+      type: object
+      required: [code]
+      properties:
+        code: { type: string }
+
+    WhatsAppChannel:
+      type: object
+      description: El número conectado. No trae secretos.
+      required: [phone_number_id, display_phone, verified_name, quality_rating, messaging_tier, status, waba_id, token_status, last_checked_at]
+      properties:
+        phone_number_id: { type: string, description: Id del número en Meta. }
+        display_phone: { type: string }
+        verified_name: { type: string }
+        quality_rating: { type: string, description: 'GREEN, YELLOW o RED (de Meta).' }
+        messaging_tier: { type: string, description: 'Nivel de mensajería de Meta (p. ej. TIER_1K).' }
+        status: { type: string, enum: [connected, needs_reauth] }
+        waba_id: { type: string }
+        token_status: { type: string, enum: [valid, invalid] }
+        last_checked_at: { type: string, format: date-time, nullable: true }
+
+    Inbox:
+      type: object
+      required: [id, organization_id, name, channel_type, archived_at, created_at, updated_at, whatsapp]
+      properties:
+        id: { type: string, format: uuid }
+        organization_id: { type: string, format: uuid }
+        name: { type: string }
+        channel_type: { type: string, enum: [whatsapp] }
+        archived_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        whatsapp:
+          nullable: true
+          description: Null si la bandeja está archivada (el número se liberó).
+          allOf:
+            - $ref: '#/components/schemas/WhatsAppChannel'
+
+    ConnectWhatsAppRequest:
+      type: object
+      required: [name, waba_id, phone_number_id, access_token]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        waba_id: { type: string, pattern: '^[0-9]{5,32}$' }
+        phone_number_id: { type: string, pattern: '^[0-9]{5,32}$' }
+        access_token: { type: string, maxLength: 1024, description: 'Se guarda cifrado; nunca se devuelve.' }
+        app_secret:
+          type: string
+          description: Solo si el negocio usa su PROPIA app de Meta. Con la app de la plataforma va vacío.
+
+    RenameInboxRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+
+    RotateCredentialsRequest:
+      type: object
+      required: [access_token]
+      properties:
+        access_token: { type: string, maxLength: 1024 }
+
+    Contact:
+      type: object
+      required: [id, organization_id, phone, name, email, custom_attributes, blocked, source, last_activity_at, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        organization_id: { type: string, format: uuid }
+        phone: { type: string, description: 'E.164, con "+".', example: '+573001234567' }
+        name: { type: string, nullable: true }
+        email: { type: string, nullable: true }
+        custom_attributes:
+          type: object
+          description: 'Hasta 50 atributos de texto (500 caracteres), número, booleano o null.'
+          additionalProperties: true
+        blocked: { type: boolean }
+        source: { type: string, enum: [inbound, manual, import, order, api] }
+        last_activity_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    CreateContactRequest:
+      type: object
+      required: [phone]
+      properties:
+        phone: { type: string, description: 'Con código de país; se aceptan espacios, guiones y paréntesis.' }
+        name: { type: string, maxLength: 255, nullable: true }
+        email: { type: string, nullable: true }
+        custom_attributes: { type: object, additionalProperties: true }
+
+    UpdateContactRequest:
+      type: object
+      description: Un campo ausente no se toca; en `name` y `email`, una cadena vacía o null lo deja en blanco.
+      properties:
+        name: { type: string, maxLength: 255, nullable: true }
+        email: { type: string, nullable: true }
+        custom_attributes: { type: object, additionalProperties: true }
+        blocked: { type: boolean }
+
+    ContactPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Contact' } }
+        next_cursor: { type: string, nullable: true }
+
+    ContactBrief:
+      type: object
+      required: [id, name, phone, blocked]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string, nullable: true }
+        phone: { type: string }
+        blocked: { type: boolean }
+
+    Conversation:
+      type: object
+      required:
+        - id
+        - organization_id
+        - inbox_id
+        - display_id
+        - status
+        - priority
+        - assignee_id
+        - handled_by
+        - contact
+        - last_customer_message_at
+        - window_expires_at
+        - can_reply
+        - reply_block_reason
+        - last_activity_at
+        - last_message_preview
+        - last_message_direction
+        - unread_count
+        - first_response_at
+        - waiting_since
+        - snoozed_until
+        - created_at
+        - updated_at
+      properties:
+        id: { type: string, format: uuid }
+        organization_id: { type: string, format: uuid }
+        inbox_id: { type: string, format: uuid }
+        display_id: { type: integer, format: int64, description: 'Número que ve el equipo (#1, #2...), por organización.' }
+        status: { type: string, enum: [open, pending, resolved, snoozed] }
+        priority: { type: string, nullable: true, enum: [low, medium, high, urgent, null] }
+        assignee_id: { type: string, format: uuid, nullable: true }
+        handled_by: { type: string, enum: [bot, human] }
+        contact: { $ref: '#/components/schemas/ContactBrief' }
+        last_customer_message_at: { type: string, format: date-time, nullable: true }
+        window_expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Cuándo se cierra la ventana de 24 h. Null si el cliente nunca escribió.
+        can_reply: { type: boolean, description: 'Si ahora se puede enviar un texto libre.' }
+        reply_block_reason:
+          type: string
+          nullable: true
+          enum: [window_closed, contact_blocked, inbox_disconnected, null]
+        last_activity_at: { type: string, format: date-time }
+        last_message_preview: { type: string, nullable: true }
+        last_message_direction: { type: string, nullable: true, enum: [inbound, outbound, null] }
+        unread_count: { type: integer }
+        first_response_at: { type: string, format: date-time, nullable: true }
+        waiting_since: { type: string, format: date-time, nullable: true }
+        snoozed_until: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    ConversationPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Conversation' } }
+        next_cursor: { type: string, nullable: true }
+
+    ConversationTabs:
+      type: object
+      required: [mine, unassigned, all]
+      properties:
+        mine: { type: integer, format: int64 }
+        unassigned: { type: integer, format: int64 }
+        all: { type: integer, format: int64 }
+
+    UpdateConversationRequest:
+      type: object
+      description: Un campo ausente no se toca; `priority`, `assignee_id` y `snoozed_until` aceptan null para dejarlos en blanco.
+      properties:
+        status: { type: string, enum: [open, pending, resolved, snoozed] }
+        priority: { type: string, nullable: true, enum: [low, medium, high, urgent, null] }
+        assignee_id: { type: string, format: uuid, nullable: true }
+        handled_by: { type: string, enum: [bot, human] }
+        snoozed_until: { type: string, format: date-time, nullable: true }
+
+    Attachment:
+      type: object
+      required: [id, kind, mime_type, filename, size_bytes, caption]
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string, enum: [image, audio, video, document, sticker] }
+        mime_type: { type: string, nullable: true }
+        filename: { type: string, nullable: true }
+        size_bytes: { type: integer, format: int64, nullable: true }
+        caption: { type: string, nullable: true }
+
+    Message:
+      type: object
+      required:
+        - id
+        - conversation_id
+        - direction
+        - kind
+        - body
+        - status
+        - error_code
+        - error_detail
+        - sender_user_id
+        - reply_to_message_id
+        - payload
+        - attachments
+        - sent_at
+        - delivered_at
+        - read_at
+        - failed_at
+        - created_at
+      properties:
+        id: { type: string, format: uuid }
+        conversation_id: { type: string, format: uuid }
+        direction: { type: string, enum: [inbound, outbound] }
+        kind:
+          type: string
+          enum: [text, image, audio, video, document, sticker, location, contacts, interactive, button, template, reaction, unsupported]
+        body: { type: string, nullable: true }
+        status:
+          type: string
+          enum: [received, queued, sent, delivered, read, failed]
+          description: 'Entrantes: `received`. Salientes: `queued` → `sent` → `delivered` → `read`, o `failed`.'
+        error_code:
+          type: string
+          nullable: true
+          description: 'Código de Meta, o `retries_exhausted`, `delivery_unknown`, `inbox_disconnected`, `network`.'
+        error_detail: { type: string, nullable: true }
+        sender_user_id: { type: string, format: uuid, nullable: true }
+        reply_to_message_id: { type: string, format: uuid, nullable: true }
+        payload:
+          type: object
+          additionalProperties: true
+          description: Datos propios del tipo (ubicación, respuesta de botón...).
+        attachments: { type: array, items: { $ref: '#/components/schemas/Attachment' } }
+        sent_at: { type: string, format: date-time, nullable: true }
+        delivered_at: { type: string, format: date-time, nullable: true }
+        read_at: { type: string, format: date-time, nullable: true }
+        failed_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+
+    MessagePage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Message' } }
+        next_cursor: { type: string, nullable: true }
+
+    SendMessageRequest:
+      type: object
+      required: [body]
+      properties:
+        body: { type: string, minLength: 1, maxLength: 4096 }
+        reply_to_message_id: { type: string, format: uuid, nullable: true }

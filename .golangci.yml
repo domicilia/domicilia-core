@@ -1,0 +1,32 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    # misspell fuera a propósito: es un corrector de inglés y marca como error
+    # las palabras en español de los comentarios.
+    - bodyclose     # respuestas HTTP sin cerrar
+    - errorlint     # comparar errores con errors.Is/As, no con ==
+    - gosec         # patrones inseguros (SQL armado a mano, secretos, etc.)
+    - noctx         # peticiones HTTP sin context
+    - sqlclosecheck # rows/stmt sin cerrar
+    - unconvert
+    - usestdlibvars
+  exclusions:
+    presets:
+      - std-error-handling
+    rules:
+      - path: _test\.go
+        linters: [gosec]
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/domicilia/domicilia-core

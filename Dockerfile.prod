@@ -1,0 +1,42 @@
+# syntax=docker/dockerfile:1
+#
+# Imagen de PRODUCCIÓN: binario estático en una imagen distroless, sin shell,
+# sin gestor de paquetes, corriendo como usuario sin privilegios.
+# Build:  docker build -f Dockerfile.prod -t ghcr.io/domicilia/domicilia-core:dev .
+#
+# Escucha en el 8080 (un usuario sin privilegios no puede enlazar puertos
+# < 1024). En el servidor el 443 lo termina Caddy, que hace proxy a este puerto.
+ARG GO_VERSION=1.27
+
+# --------------------------------------------------------------------------
+# build — compila un binario estático
+# --------------------------------------------------------------------------
+FROM golang:${GO_VERSION}-alpine AS build
+
+WORKDIR /src
+
+# Capa de dependencias separada del código: mientras go.mod/go.sum no cambien,
+# editar un handler no vuelve a descargar nada.
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+
+COPY . .
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/api ./cmd/api
+
+# --------------------------------------------------------------------------
+# runtime — solo el binario (+ certificados CA y zona horaria, ya incluidos)
+# --------------------------------------------------------------------------
+FROM gcr.io/distroless/static:nonroot
+
+COPY --from=build /out/api /api
+
+USER nonroot:nonroot
+EXPOSE 8080
+
+# Distroless no trae curl/wget: el healthcheck es el propio binario.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD ["/api", "healthcheck"]
+
+ENTRYPOINT ["/api"]

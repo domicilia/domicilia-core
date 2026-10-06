@@ -1,0 +1,5 @@
+# Finales de línea LF en todo el repo, sin importar core.autocrlf del equipo.
+# En Windows con autocrlf=true, sin esto los .go se descargan en CRLF y
+# gofmt/golangci-lint los marcan como "sin formatear"; un Dockerfile o un
+# Makefile con CRLF además rompe `RUN` y las recetas de make.
+* text=auto eol=lf

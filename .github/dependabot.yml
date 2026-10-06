@@ -1,0 +1,18 @@
+version: 2
+updates:
+  # Dependencias de Go (incluye las directivas `tool`: sqlc, air, golangci-lint).
+  - package-ecosystem: gomod
+    directory: /
+    schedule: {interval: weekly}
+    groups:
+      go-minor-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: {interval: weekly}
+
+  # Imágenes base de Dockerfile.dev / Dockerfile.prod.
+  - package-ecosystem: docker
+    directory: /
+    schedule: {interval: weekly}

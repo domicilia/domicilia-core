@@ -1,0 +1,22 @@
+.git
+.github
+.gitignore
+.dockerignore
+.env
+.env.*
+!.env.example
+
+bin
+tmp
+coverage.out
+*.exe
+*.test
+
+# No se ejecutan en runtime
+Dockerfile*
+Makefile
+README.md
+CLAUDE.md
+.golangci.yml
+.air.toml
+lefthook.yml

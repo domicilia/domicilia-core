@@ -1,0 +1,243 @@
+name: promote-produccion
+
+# Promociona a PRODUCCIÓN (domicilia.com.co) una imagen ya probada en
+# staging. Solo se dispara a mano: ese clic ES la aprobación.
+#
+# NO reconstruye nada. Vuelve a etiquetar el mismo digest que lleva días
+# corriendo en staging, así que los bytes que entran en producción son
+# exactamente los que se validaron. Un rebuild "idéntico" no lo es: cambian
+# dependencias transitivas, la fecha, el orden de las capas.
+
+on:
+  workflow_dispatch:
+    inputs:
+      origen:
+        description: 'Etiqueta o digest a promocionar (staging, sha-a1b2c3d, sha256:...)'
+        type: string
+        default: 'staging'
+        required: true
+      desplegar:
+        description: 'Desplegar en la VM. Desmárcalo para solo publicar la etiqueta :prod (necesario la primera vez, antes de que exista el stack de producción).'
+        type: boolean
+        default: true
+
+concurrency:
+  group: deploy-prod-core
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      PUBLIC_URL: https://domicilia.com.co
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolver el digest de origen
+        id: origen
+        run: |
+          set -euo pipefail
+          ref="${{ inputs.origen }}"
+          case "$ref" in
+            sha256:*) full="${REGISTRY}/${IMAGE_NAME}@${ref}" ;;
+            *)        full="${REGISTRY}/${IMAGE_NAME}:${ref}" ;;
+          esac
+          digest=$(docker buildx imagetools inspect "$full" --format '{{.Manifest.Digest}}')
+          echo "Origen : $full"
+          echo "Digest : $digest"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Etiquetar como :prod
+        # imagetools create copia el manifiesto en el registro. No descarga
+        # ni reconstruye la imagen: es una operación de metadatos.
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            -t "${REGISTRY}/${IMAGE_NAME}:prod" \
+            "${REGISTRY}/${IMAGE_NAME}@${{ steps.origen.outputs.digest }}"
+          echo "==> ${REGISTRY}/${IMAGE_NAME}:prod -> ${{ steps.origen.outputs.digest }}"
+
+      - name: Azure login (OIDC)
+        if: inputs.desplegar && env.AZURE_CLIENT_ID != ''
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Encender la VM si el auto-shutdown la apagó
+        if: inputs.desplegar && env.AZURE_CLIENT_ID != ''
+        env:
+          RG: ${{ secrets.RESOURCE_GROUP }}
+          VM: ${{ secrets.VM_NAME }}
+        run: |
+          set -euo pipefail
+          estado=$(az vm get-instance-view -g "$RG" -n "$VM" \
+            --query "instanceView.statuses[?starts_with(code,'PowerState/')].code | [0]" -o tsv)
+          echo "PowerState: $estado"
+          if [ "$estado" != "PowerState/running" ]; then
+            az vm start -g "$RG" -n "$VM"
+            sleep 20
+          fi
+
+      - name: Abrir el puerto 22 solo para este runner
+        # El NSG mantiene el 22 cerrado. Esta regla lo abre para la IP
+        # concreta de este runner y se elimina al terminar el job, pase lo
+        # que pase. Nombre y prioridad propios de este workflow para que dos
+        # ejecuciones simultáneas no se pisen la regla.
+        if: inputs.desplegar && env.AZURE_CLIENT_ID != ''
+        id: nsg
+        env:
+          RG: ${{ secrets.RESOURCE_GROUP }}
+          NSG: nsg-domicilia-staging
+          REGLA: gha-core-prod
+          PRIORIDAD: '155'
+        run: |
+          set -euo pipefail
+          IP=$(curl -sf --max-time 15 https://api.ipify.org)
+          [ -n "$IP" ] || { echo "no se pudo determinar la IP del runner" >&2; exit 1; }
+          echo "IP del runner: ${IP}"
+          # Borra cualquier resto de una ejecución anterior que no llegara a
+          # limpiar. Hace idempotente la creación sin enmascarar errores.
+          az network nsg rule delete -g "$RG" --nsg-name "$NSG" -n "$REGLA" -o none 2>/dev/null || true
+
+          # El CLI de Azure falla de vez en cuando por un deadlock interno al
+          # importar sus propios módulos (ocurrió el 29-ago-2026). Es
+          # transitorio, así que se reintenta.
+          #
+          # NO se usa `create || update`: si `create` falla por un motivo
+          # distinto a "ya existe", el `update` falla después con un NotFound
+          # que oculta la causa real. Fue exactamente lo que pasó.
+          creada=""
+          for intento in 1 2 3; do
+            if az network nsg rule create -g "$RG" --nsg-name "$NSG" -n "$REGLA" \
+                 --priority "$PRIORIDAD" --direction Inbound --access Allow --protocol Tcp \
+                 --source-address-prefixes "${IP}/32" --destination-port-ranges 22 \
+                 --description "Temporal - GitHub Actions run ${{ github.run_id }}" -o none; then
+              creada=si; break
+            fi
+            echo "intento ${intento} fallido; reintentando en 10 s…" >&2
+            sleep 10
+          done
+          [ -n "$creada" ] || { echo "no se pudo abrir el puerto 22 tras 3 intentos" >&2; exit 1; }
+          echo "abierta=si" >> "$GITHUB_OUTPUT"
+
+      - name: Configurar clave SSH
+        if: inputs.desplegar
+        env:
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          if [ -n "${SSH_KNOWN_HOSTS:-}" ]; then
+            printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            echo "AVISO: SSH_KNOWN_HOSTS no definido, usando ssh-keyscan (TOFU)"
+            ssh-keyscan -T 15 "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          fi
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Desplegar en producción
+        if: inputs.desplegar
+        run: |
+          set -euo pipefail
+          ssh -o BatchMode=yes -o ConnectTimeout=20 "$SSH_USER@$SSH_HOST" \
+            'bash -euo pipefail -s' <<'REMOTE'
+          DOMI=/opt/domicilia/domi.sh
+
+          CID=$($DOMI prod ps -q core || true)
+          ANTERIOR=""
+          [ -n "$CID" ] && ANTERIOR=$(docker inspect --format '{{.Image}}' "$CID")
+          echo "==> Imagen anterior: ${ANTERIOR:-(ninguna)}"
+
+          $DOMI prod pull core
+
+          # Las migraciones de producción se aplican con el servicio viejo
+          # todavía en pie. Si fallan, no se ha reemplazado nada. Van embebidas en
+          # el binario (imagen distroless: sin shell ni `goose` aparte).
+          echo "==> api migrate up (PRODUCCIÓN)"
+          # -T y "< /dev/null": ver el comentario en deploy.yml — sin esto,
+          # el resto del script (up -d core, healthcheck) nunca se ejecuta.
+          $DOMI prod run --rm -T core migrate up < /dev/null
+
+          $DOMI prod up -d core
+
+          echo "==> Esperando healthcheck"
+          CID=$($DOMI prod ps -q core)
+          for i in $(seq 1 30); do
+            estado=$(docker inspect --format '{{.State.Health.Status}}' "$CID" 2>/dev/null || echo starting)
+            [ "$estado" = "healthy" ] && { echo "OK tras ${i}0s"; exit 0; }
+            [ "$estado" = "unhealthy" ] && break
+            sleep 10
+          done
+
+          echo "ERROR: el core no llegó a healthy. Últimas trazas:" >&2
+          $DOMI prod logs --tail 80 core >&2
+
+          if [ -n "$ANTERIOR" ]; then
+            echo "==> Rollback a $ANTERIOR" >&2
+            docker tag "$ANTERIOR" ghcr.io/domicilia/domicilia-core:prod
+            $DOMI prod up -d core
+          fi
+          # El rollback devuelve el código, NO la base de datos (`api migrate down` se niega a
+          # correr en producción: restaurar el respaldo es manual).
+          exit 1
+          REMOTE
+
+      - name: Verificación externa
+        if: inputs.desplegar
+        run: |
+          set -euo pipefail
+          codigo=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "$PUBLIC_URL/" || echo 000)
+          echo "GET $PUBLIC_URL/ -> $codigo"
+          [ "$codigo" -lt 400 ] || exit 1
+
+      - name: Cerrar el puerto 22
+        # `always()` para que la regla se borre aunque el despliegue falle o
+        # el job se cancele. Dejarla abierta sería peor que no haberla
+        # abierto nunca: nadie la estaría vigilando.
+        if: always() && steps.nsg.outputs.abierta == 'si'
+        env:
+          RG: ${{ secrets.RESOURCE_GROUP }}
+          NSG: nsg-domicilia-staging
+          REGLA: gha-core-prod
+        run: |
+          if az network nsg rule delete -g "$RG" --nsg-name "$NSG" -n "$REGLA" -o none; then
+            echo "regla $REGLA eliminada, puerto 22 cerrado"
+          else
+            echo "AVISO: no se pudo eliminar $REGLA. Bórrala a mano:" >&2
+            echo "  az network nsg rule delete -g $RG --nsg-name $NSG -n $REGLA" >&2
+            exit 1
+          fi
+
+      - name: Resumen
+        if: always()
+        run: |
+          {
+            echo "### Promoción a producción"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Origen | \`${{ inputs.origen }}\` |"
+            echo "| Digest | \`${{ steps.origen.outputs.digest }}\` |"
+            echo "| Desplegado | ${{ inputs.desplegar }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

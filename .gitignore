@@ -1,0 +1,17 @@
+# Binarios y temporales de build
+/bin/
+/tmp/
+*.exe
+*.test
+*.out
+coverage.*
+
+# Secretos y entornos locales: nunca al repo
+.env
+.env.*
+!.env.example
+
+# Editor / SO
+.idea/
+.vscode/
+.DS_Store

@@ -1,0 +1,11 @@
+# Setup: `lefthook install` (requiere lefthook instalado).
+# Rápido a propósito: el lint completo (make check) corre en el CI.
+pre-commit:
+  parallel: true
+  commands:
+    gofmt:
+      glob: "*.go"
+      run: test -z "$(gofmt -l {staged_files})" || (echo "Sin formatear (make fmt):" && gofmt -l {staged_files} && exit 1)
+    vet:
+      glob: "*.go"
+      run: go vet ./...

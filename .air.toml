@@ -1,0 +1,25 @@
+# Recarga en caliente (make dev y el servicio `core` del devstack).
+root = "."
+tmp_dir = "tmp"
+
+[build]
+  cmd = "go build -o ./tmp/api ./cmd/api"
+  entrypoint = ["./tmp/api"]
+  include_ext = ["go", "sql"] # .sql: las migraciones van embebidas en el binario
+  exclude_dir = ["tmp", "bin", ".git", ".github"]
+  exclude_regex = ["_test\\.go"]
+  delay = 500
+  # Docker Desktop en Windows no propaga los eventos del sistema de archivos
+  # a un bind mount: sin polling, air nunca se entera de que guardaste.
+  poll = true
+  poll_interval = 1000
+  # SIGINT primero: el servidor hace cierre ordenado antes de recompilar.
+  send_interrupt = true
+  kill_delay = "5s"
+
+[log]
+  time = false
+  main_only = true
+
+[misc]
+  clean_on_exit = true

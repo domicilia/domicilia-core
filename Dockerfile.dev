@@ -1,0 +1,19 @@
+# syntax=docker/dockerfile:1
+#
+# Imagen de DESARROLLO (devstack): recarga en caliente con air.
+# El código llega por bind mount desde domicilia-devstack (../domicilia-core:/app),
+# así que esta imagen solo trae el toolchain y las dependencias ya descargadas.
+ARG GO_VERSION=1.27
+FROM golang:${GO_VERSION}-alpine
+
+# air se compila desde la versión FIJADA en go.mod (directiva `tool`): la misma
+# que usa `make dev` fuera de Docker. Nada de `@latest`.
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go mod download \
+ && go build -o /usr/local/bin/air github.com/air-verse/air
+
+EXPOSE 8080
+CMD ["air", "-c", ".air.toml"]

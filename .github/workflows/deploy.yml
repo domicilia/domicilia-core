@@ -1,0 +1,289 @@
+name: deploy-staging
+
+# Cada merge a main construye la imagen de domicilia-core, la publica en GHCR y la
+# despliega en STAGING (staging.domicilia.com.co). Producción NO se toca aquí: se
+# promociona a mano desde promote.yml.
+#
+# domicilia-core es TODO el backend (domicilia-api/FastAPI ya no recibe tráfico; su
+# repo queda solo con el agente de IA). Este workflow reemplaza al de domicilia-api.
+#
+# PRIMER DESPLIEGUE (una sola vez, a mano, ANTES de que corra este workflow): la base
+# de datos ya existe porque la creó Alembic, así que la migración base de goose se
+# ADOPTA sin ejecutarla. Ver "Pasar el backend a domicilia-core" en
+# domicilia-infra/deploy/README.md. Después de eso, este workflow solo aplica lo nuevo.
+#
+# La imagen se construye en el runner, no en la VM: docker-compose.yml no
+# tiene secciones `build:`, y la VM es una D2as_v7 de 2 vCPU que además corre
+# Postgres de los dos entornos.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Un despliegue a la vez por entorno. Dos `docker compose up` simultáneos
+# sobre el mismo proyecto dejan el stack en un estado indeterminado.
+concurrency:
+  group: deploy-staging-core
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  # github.repository == domicilia/domicilia-core. GHCR exige minúsculas y el
+  # GITHUB_TOKEN solo publica bajo el namespace del dueño del repo: por eso
+  # la imagen vive en ghcr.io/domicilia/, no en una cuenta personal.
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ---------------------------------------------------------------------
+  # 1. Calidad — el mismo ci.yml que corre en cada PR: gofmt, vet, golangci-lint,
+  #    pruebas con detector de carreras contra un Postgres real (testcontainers),
+  #    gitleaks sobre el historial y build de la imagen de producción. Se reutiliza
+  #    (workflow_call) en vez de copiar sus pasos: dos copias acaban divergiendo.
+  # ---------------------------------------------------------------------
+  quality:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  # ---------------------------------------------------------------------
+  # 2. Build + push a GHCR
+  # ---------------------------------------------------------------------
+  build:
+    needs: quality
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # `staging` es el puntero móvil que despliega este workflow.
+          # `sha-xxxxxxx` es el identificador inmutable que luego promociona
+          # promote.yml a producción sin reconstruir nada.
+          tags: |
+            type=raw,value=staging
+            type=sha,format=short
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.prod
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # La caché de GHA sobrevive entre ejecuciones: sin ella cada build
+          # reinstala todas las dependencias desde cero.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+  # ---------------------------------------------------------------------
+  # 3. Despliegue en staging
+  # ---------------------------------------------------------------------
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write   # OIDC federado hacia Azure
+    env:
+      # Se exponen como env para poder consultarlas en `if:`; el contexto
+      # `secrets` no está disponible en condicionales de step.
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      PUBLIC_URL: https://staging.domicilia.com.co
+    steps:
+      - name: Azure login (OIDC)
+        if: env.AZURE_CLIENT_ID != ''
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Encender la VM si el auto-shutdown la apagó
+        # terraform.tfvars fija shutdown_time=2000 (SA Pacific). Sin este
+        # paso, todo merge posterior a las 20:00 muere en el SSH.
+        if: env.AZURE_CLIENT_ID != ''
+        env:
+          RG: ${{ secrets.RESOURCE_GROUP }}
+          VM: ${{ secrets.VM_NAME }}
+        run: |
+          set -euo pipefail
+          estado=$(az vm get-instance-view -g "$RG" -n "$VM" \
+            --query "instanceView.statuses[?starts_with(code,'PowerState/')].code | [0]" -o tsv)
+          echo "PowerState: $estado"
+          if [ "$estado" != "PowerState/running" ]; then
+            echo "==> Arrancando $VM"
+            az vm start -g "$RG" -n "$VM"
+            sleep 20   # margen para que sshd acepte conexiones
+          fi
+
+      - name: Abrir el puerto 22 solo para este runner
+        # El NSG mantiene el 22 cerrado. Esta regla lo abre para la IP
+        # concreta de este runner y se elimina al terminar el job, pase lo
+        # que pase. Cada workflow usa su propio nombre y prioridad para que
+        # dos ejecuciones simultáneas no se pisen la regla.
+        if: env.AZURE_CLIENT_ID != ''
+        id: nsg
+        env:
+          RG: ${{ secrets.RESOURCE_GROUP }}
+          NSG: nsg-domicilia-staging
+          REGLA: gha-core-staging
+          PRIORIDAD: '154'
+        run: |
+          set -euo pipefail
+          IP=$(curl -sf --max-time 15 https://api.ipify.org)
+          [ -n "$IP" ] || { echo "no se pudo determinar la IP del runner" >&2; exit 1; }
+          echo "IP del runner: ${IP}"
+          # Borra cualquier resto de una ejecución anterior que no llegara a
+          # limpiar. Hace idempotente la creación sin enmascarar errores.
+          az network nsg rule delete -g "$RG" --nsg-name "$NSG" -n "$REGLA" -o none 2>/dev/null || true
+
+          # El CLI de Azure falla de vez en cuando por un deadlock interno al
+          # importar sus propios módulos (ocurrió el 29-ago-2026). Es
+          # transitorio, así que se reintenta.
+          #
+          # NO se usa `create || update`: si `create` falla por un motivo
+          # distinto a "ya existe", el `update` falla después con un NotFound
+          # que oculta la causa real. Fue exactamente lo que pasó.
+          creada=""
+          for intento in 1 2 3; do
+            if az network nsg rule create -g "$RG" --nsg-name "$NSG" -n "$REGLA" \
+                 --priority "$PRIORIDAD" --direction Inbound --access Allow --protocol Tcp \
+                 --source-address-prefixes "${IP}/32" --destination-port-ranges 22 \
+                 --description "Temporal - GitHub Actions run ${{ github.run_id }}" -o none; then
+              creada=si; break
+            fi
+            echo "intento ${intento} fallido; reintentando en 10 s…" >&2
+            sleep 10
+          done
+          [ -n "$creada" ] || { echo "no se pudo abrir el puerto 22 tras 3 intentos" >&2; exit 1; }
+          echo "abierta=si" >> "$GITHUB_OUTPUT"
+
+      - name: Configurar clave SSH
+        env:
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          if [ -n "${SSH_KNOWN_HOSTS:-}" ]; then
+            printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            # TOFU: se acepta la huella que devuelva el host ahora mismo.
+            # Es el eslabón débil del pipeline — define SSH_KNOWN_HOSTS
+            # (salida de `ssh-keyscan <host>`) y elimina esta rama.
+            echo "AVISO: SSH_KNOWN_HOSTS no definido, usando ssh-keyscan (TOFU)"
+            ssh-keyscan -T 15 "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          fi
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Pull, migraciones y arranque
+        run: |
+          set -euo pipefail
+          ssh -o BatchMode=yes -o ConnectTimeout=20 "$SSH_USER@$SSH_HOST" \
+            'bash -euo pipefail -s' <<'REMOTE'
+          DOMI=/opt/domicilia/domi.sh
+
+          # Imagen actualmente en ejecución: es el punto de retorno si el
+          # despliegue sale mal. Se guarda el ID, no la etiqueta, porque
+          # `staging` va a apuntar a la imagen nueva tras el pull.
+          CID=$($DOMI staging ps -q core || true)
+          ANTERIOR=""
+          [ -n "$CID" ] && ANTERIOR=$(docker inspect --format '{{.Image}}' "$CID")
+          echo "==> Imagen anterior: ${ANTERIOR:-(ninguna)}"
+
+          $DOMI staging pull core
+
+          # Las migraciones de goose van EMBEBIDAS en el binario (la imagen es
+          # distroless: no hay shell ni un `goose` aparte) y se aplican ANTES de
+          # reemplazar el contenedor: si fallan, el servicio viejo sigue en pie
+          # intacto.
+          echo "==> api migrate up"
+          # -T (sin pseudo-TTY) no basta: "docker compose run" sigue
+          # conectando su stdin al del proceso que lo llama aunque no haya
+          # TTY, y aquí ese stdin ES el heredoc de todo este script — migrate
+          # se queda leyendo de ahí y se traga en silencio TODO lo que sigue
+          # ("up -d core", el healthcheck). El paso reportaba éxito igual: el
+          # heredoc truncado no deja ningún comando que falle. "< /dev/null"
+          # corta esa conexión del todo.
+          $DOMI staging run --rm -T core migrate up < /dev/null
+
+          $DOMI staging up -d core
+
+          echo "==> Esperando healthcheck"
+          CID=$($DOMI staging ps -q core)
+          for i in $(seq 1 30); do
+            estado=$(docker inspect --format '{{.State.Health.Status}}' "$CID" 2>/dev/null || echo starting)
+            [ "$estado" = "healthy" ] && { echo "OK tras ${i}0s"; exit 0; }
+            [ "$estado" = "unhealthy" ] && break
+            sleep 10
+          done
+
+          echo "ERROR: el core no llegó a healthy. Últimas trazas:" >&2
+          $DOMI staging logs --tail 80 core >&2
+
+          if [ -n "$ANTERIOR" ]; then
+            echo "==> Rollback a $ANTERIOR" >&2
+            docker tag "$ANTERIOR" ghcr.io/domicilia/domicilia-core:staging
+            $DOMI staging up -d core
+          fi
+          # OJO: el rollback devuelve el código, NO la base de datos. Si la
+          # migración se aplicó y el esquema nuevo es incompatible con la imagen
+          # anterior hay que restaurar el respaldo: `api migrate down` se niega a
+          # correr en staging/producción a propósito (revertir la base borra tablas).
+          exit 1
+          REMOTE
+
+      - name: Verificación externa
+        # Comprueba el camino real que recorre un usuario: Caddy -> web.
+        # Si esto falla pero el contenedor estaba healthy, el problema es de
+        # proxy, TLS o DNS, no de la imagen.
+        run: |
+          set -euo pipefail
+          codigo=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "$PUBLIC_URL/" || echo 000)
+          echo "GET $PUBLIC_URL/ -> $codigo"
+          [ "$codigo" -lt 400 ] || exit 1
+
+      - name: Cerrar el puerto 22
+        # `always()` para que la regla se borre aunque el despliegue falle o
+        # el job se cancele. Dejarla abierta seria peor que no haberla abierto
+        # nunca: nadie la estaria vigilando.
+        if: always() && steps.nsg.outputs.abierta == 'si'
+        env:
+          RG: ${{ secrets.RESOURCE_GROUP }}
+          NSG: nsg-domicilia-staging
+          REGLA: gha-core-staging
+        run: |
+          if az network nsg rule delete -g "$RG" --nsg-name "$NSG" -n "$REGLA" -o none; then
+            echo "regla $REGLA eliminada, puerto 22 cerrado"
+          else
+            echo "AVISO: no se pudo eliminar $REGLA. Bórrala a mano:" >&2
+            echo "  az network nsg rule delete -g $RG --nsg-name $NSG -n $REGLA" >&2
+            exit 1
+          fi
