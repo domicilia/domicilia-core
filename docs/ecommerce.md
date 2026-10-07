@@ -145,6 +145,9 @@ cliente: por `customer_id`, sin permiso de organización de por medio.
 
 ## 3. Pagos — **hecho** (`internal/payments`, `internal/epayco`)
 
+> **Diseño siguiente (multipasarela, link de cobro para WhatsApp, widget, modelo de recaudo):**
+> ver [`pagos.md`](pagos.md). Reemplaza el "modelo de custodia v2" de §0.
+
 ```go
 type Gateway interface {
     Name() string
