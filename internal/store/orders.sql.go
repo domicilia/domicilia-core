@@ -16,7 +16,7 @@ const applyPromotionToOrder = `-- name: ApplyPromotionToOrder :one
 UPDATE orders
 SET promotion_id = $1, discount_cents = $2, total_cents = $3, updated_at = now()
 WHERE id = $4 AND organization_id = $5 AND status = 'draft'
-RETURNING id, organization_id, customer_id, status, subtotal_cents, discount_cents, delivery_fee_cents, total_cents, placed_at, status_changed_at, created_at, updated_at, promotion_id
+RETURNING id, organization_id, customer_id, status, subtotal_cents, discount_cents, delivery_fee_cents, total_cents, placed_at, status_changed_at, created_at, updated_at, promotion_id, subtotal_local_cents, platform_fee_cents, courier_fee_cents, pricing_snapshot
 `
 
 type ApplyPromotionToOrderParams struct {
@@ -52,6 +52,10 @@ func (q *Queries) ApplyPromotionToOrder(ctx context.Context, arg ApplyPromotionT
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.PromotionID,
+		&i.SubtotalLocalCents,
+		&i.PlatformFeeCents,
+		&i.CourierFeeCents,
+		&i.PricingSnapshot,
 	)
 	return i, err
 }
@@ -110,7 +114,7 @@ INSERT INTO orders (organization_id, customer_id)
 VALUES ($1, $2)
 ON CONFLICT (organization_id, customer_id) WHERE status = 'draft'
 DO UPDATE SET updated_at = orders.updated_at
-RETURNING id, organization_id, customer_id, status, subtotal_cents, discount_cents, delivery_fee_cents, total_cents, placed_at, status_changed_at, created_at, updated_at, promotion_id
+RETURNING id, organization_id, customer_id, status, subtotal_cents, discount_cents, delivery_fee_cents, total_cents, placed_at, status_changed_at, created_at, updated_at, promotion_id, subtotal_local_cents, platform_fee_cents, courier_fee_cents, pricing_snapshot
 `
 
 type GetOrCreateDraftOrderParams struct {
@@ -142,12 +146,16 @@ func (q *Queries) GetOrCreateDraftOrder(ctx context.Context, arg GetOrCreateDraf
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.PromotionID,
+		&i.SubtotalLocalCents,
+		&i.PlatformFeeCents,
+		&i.CourierFeeCents,
+		&i.PricingSnapshot,
 	)
 	return i, err
 }
 
 const getOrder = `-- name: GetOrder :one
-SELECT id, organization_id, customer_id, status, subtotal_cents, discount_cents, delivery_fee_cents, total_cents, placed_at, status_changed_at, created_at, updated_at, promotion_id FROM orders WHERE id = $1 AND organization_id = $2
+SELECT id, organization_id, customer_id, status, subtotal_cents, discount_cents, delivery_fee_cents, total_cents, placed_at, status_changed_at, created_at, updated_at, promotion_id, subtotal_local_cents, platform_fee_cents, courier_fee_cents, pricing_snapshot FROM orders WHERE id = $1 AND organization_id = $2
 `
 
 type GetOrderParams struct {
@@ -172,12 +180,16 @@ func (q *Queries) GetOrder(ctx context.Context, arg GetOrderParams) (Order, erro
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.PromotionID,
+		&i.SubtotalLocalCents,
+		&i.PlatformFeeCents,
+		&i.CourierFeeCents,
+		&i.PricingSnapshot,
 	)
 	return i, err
 }
 
 const getOrderByID = `-- name: GetOrderByID :one
-SELECT id, organization_id, customer_id, status, subtotal_cents, discount_cents, delivery_fee_cents, total_cents, placed_at, status_changed_at, created_at, updated_at, promotion_id FROM orders WHERE id = $1
+SELECT id, organization_id, customer_id, status, subtotal_cents, discount_cents, delivery_fee_cents, total_cents, placed_at, status_changed_at, created_at, updated_at, promotion_id, subtotal_local_cents, platform_fee_cents, courier_fee_cents, pricing_snapshot FROM orders WHERE id = $1
 `
 
 // Sin organization_id: la usa el cliente para ver/cancelar UNO de sus propios pedidos por
@@ -200,12 +212,16 @@ func (q *Queries) GetOrderByID(ctx context.Context, id uuid.UUID) (Order, error)
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.PromotionID,
+		&i.SubtotalLocalCents,
+		&i.PlatformFeeCents,
+		&i.CourierFeeCents,
+		&i.PricingSnapshot,
 	)
 	return i, err
 }
 
 const getOrderItem = `-- name: GetOrderItem :one
-SELECT id, order_id, organization_id, product_variant_id, name_snapshot, unit_price_cents_snapshot, modifiers_snapshot, unit_total_cents, quantity, line_total_cents, created_at, updated_at FROM order_items WHERE id = $1 AND order_id = $2 AND organization_id = $3
+SELECT id, order_id, organization_id, product_variant_id, name_snapshot, unit_price_cents_snapshot, modifiers_snapshot, unit_total_cents, quantity, line_total_cents, created_at, updated_at, unit_local_total_cents, platform_fee_bps FROM order_items WHERE id = $1 AND order_id = $2 AND organization_id = $3
 `
 
 type GetOrderItemParams struct {
@@ -230,6 +246,8 @@ func (q *Queries) GetOrderItem(ctx context.Context, arg GetOrderItemParams) (Ord
 		&i.LineTotalCents,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.UnitLocalTotalCents,
+		&i.PlatformFeeBps,
 	)
 	return i, err
 }
@@ -238,12 +256,14 @@ const insertOrderItem = `-- name: InsertOrderItem :one
 
 INSERT INTO order_items (
     order_id, organization_id, product_variant_id, name_snapshot,
-    unit_price_cents_snapshot, modifiers_snapshot, unit_total_cents, quantity, line_total_cents
+    unit_price_cents_snapshot, modifiers_snapshot, unit_total_cents, quantity, line_total_cents,
+    unit_local_total_cents, platform_fee_bps
 ) VALUES (
     $1, $2, $3, $4,
-    $5, $6, $7, $8, $9
+    $5, $6, $7, $8, $9,
+    $10, $11
 )
-RETURNING id, order_id, organization_id, product_variant_id, name_snapshot, unit_price_cents_snapshot, modifiers_snapshot, unit_total_cents, quantity, line_total_cents, created_at, updated_at
+RETURNING id, order_id, organization_id, product_variant_id, name_snapshot, unit_price_cents_snapshot, modifiers_snapshot, unit_total_cents, quantity, line_total_cents, created_at, updated_at, unit_local_total_cents, platform_fee_bps
 `
 
 type InsertOrderItemParams struct {
@@ -256,6 +276,8 @@ type InsertOrderItemParams struct {
 	UnitTotalCents         int32
 	Quantity               int32
 	LineTotalCents         int32
+	UnitLocalTotalCents    int32
+	PlatformFeeBps         int32
 }
 
 // ---------------------------------------------------------------------------
@@ -272,6 +294,8 @@ func (q *Queries) InsertOrderItem(ctx context.Context, arg InsertOrderItemParams
 		arg.UnitTotalCents,
 		arg.Quantity,
 		arg.LineTotalCents,
+		arg.UnitLocalTotalCents,
+		arg.PlatformFeeBps,
 	)
 	var i OrderItem
 	err := row.Scan(
@@ -287,6 +311,8 @@ func (q *Queries) InsertOrderItem(ctx context.Context, arg InsertOrderItemParams
 		&i.LineTotalCents,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.UnitLocalTotalCents,
+		&i.PlatformFeeBps,
 	)
 	return i, err
 }
@@ -346,7 +372,7 @@ func (q *Queries) ListMyDraftOrders(ctx context.Context, customerID uuid.UUID) (
 }
 
 const listOrderItemsByOrder = `-- name: ListOrderItemsByOrder :many
-SELECT id, order_id, organization_id, product_variant_id, name_snapshot, unit_price_cents_snapshot, modifiers_snapshot, unit_total_cents, quantity, line_total_cents, created_at, updated_at FROM order_items WHERE order_id = $1 ORDER BY created_at, id
+SELECT id, order_id, organization_id, product_variant_id, name_snapshot, unit_price_cents_snapshot, modifiers_snapshot, unit_total_cents, quantity, line_total_cents, created_at, updated_at, unit_local_total_cents, platform_fee_bps FROM order_items WHERE order_id = $1 ORDER BY created_at, id
 `
 
 func (q *Queries) ListOrderItemsByOrder(ctx context.Context, orderID uuid.UUID) ([]OrderItem, error) {
@@ -371,6 +397,8 @@ func (q *Queries) ListOrderItemsByOrder(ctx context.Context, orderID uuid.UUID) 
 			&i.LineTotalCents,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.UnitLocalTotalCents,
+			&i.PlatformFeeBps,
 		); err != nil {
 			return nil, err
 		}
@@ -383,7 +411,7 @@ func (q *Queries) ListOrderItemsByOrder(ctx context.Context, orderID uuid.UUID) 
 }
 
 const listOrdersByCustomer = `-- name: ListOrdersByCustomer :many
-SELECT id, organization_id, customer_id, status, subtotal_cents, discount_cents, delivery_fee_cents, total_cents, placed_at, status_changed_at, created_at, updated_at, promotion_id FROM orders WHERE customer_id = $1 AND status <> 'draft'
+SELECT id, organization_id, customer_id, status, subtotal_cents, discount_cents, delivery_fee_cents, total_cents, placed_at, status_changed_at, created_at, updated_at, promotion_id, subtotal_local_cents, platform_fee_cents, courier_fee_cents, pricing_snapshot FROM orders WHERE customer_id = $1 AND status <> 'draft'
 ORDER BY created_at DESC, id DESC
 LIMIT $3 OFFSET $2
 `
@@ -418,6 +446,10 @@ func (q *Queries) ListOrdersByCustomer(ctx context.Context, arg ListOrdersByCust
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.PromotionID,
+			&i.SubtotalLocalCents,
+			&i.PlatformFeeCents,
+			&i.CourierFeeCents,
+			&i.PricingSnapshot,
 		); err != nil {
 			return nil, err
 		}
@@ -430,7 +462,7 @@ func (q *Queries) ListOrdersByCustomer(ctx context.Context, arg ListOrdersByCust
 }
 
 const listOrdersByOrganization = `-- name: ListOrdersByOrganization :many
-SELECT id, organization_id, customer_id, status, subtotal_cents, discount_cents, delivery_fee_cents, total_cents, placed_at, status_changed_at, created_at, updated_at, promotion_id FROM orders
+SELECT id, organization_id, customer_id, status, subtotal_cents, discount_cents, delivery_fee_cents, total_cents, placed_at, status_changed_at, created_at, updated_at, promotion_id, subtotal_local_cents, platform_fee_cents, courier_fee_cents, pricing_snapshot FROM orders
 WHERE organization_id = $1
   AND ($2::text IS NULL OR status = $2)
 ORDER BY created_at DESC, id DESC
@@ -472,6 +504,10 @@ func (q *Queries) ListOrdersByOrganization(ctx context.Context, arg ListOrdersBy
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.PromotionID,
+			&i.SubtotalLocalCents,
+			&i.PlatformFeeCents,
+			&i.CourierFeeCents,
+			&i.PricingSnapshot,
 		); err != nil {
 			return nil, err
 		}
@@ -486,25 +522,28 @@ func (q *Queries) ListOrdersByOrganization(ctx context.Context, arg ListOrdersBy
 const recalcCartAmounts = `-- name: RecalcCartAmounts :one
 UPDATE orders
 SET subtotal_cents = $1, discount_cents = 0, promotion_id = NULL,
-    total_cents = $2, updated_at = now()
-WHERE id = $3 AND organization_id = $4
-RETURNING id, organization_id, customer_id, status, subtotal_cents, discount_cents, delivery_fee_cents, total_cents, placed_at, status_changed_at, created_at, updated_at, promotion_id
+    delivery_fee_cents = $2, total_cents = $3, updated_at = now()
+WHERE id = $4 AND organization_id = $5
+RETURNING id, organization_id, customer_id, status, subtotal_cents, discount_cents, delivery_fee_cents, total_cents, placed_at, status_changed_at, created_at, updated_at, promotion_id, subtotal_local_cents, platform_fee_cents, courier_fee_cents, pricing_snapshot
 `
 
 type RecalcCartAmountsParams struct {
-	SubtotalCents  int32
-	TotalCents     int32
-	ID             uuid.UUID
-	OrganizationID uuid.UUID
+	SubtotalCents    int32
+	DeliveryFeeCents int32
+	TotalCents       int32
+	ID               uuid.UUID
+	OrganizationID   uuid.UUID
 }
 
 // Recalcula subtotal_cents desde las líneas reales — nunca se confía en un total que mandó el
 // cliente — y BORRA cualquier promoción aplicada: un cambio en el carrito invalida un descuento
 // calculado contra el subtotal anterior (ver internal/promotions). La llaman las mutaciones del
-// carrito (agregar/cambiar/quitar una línea), nunca place().
+// carrito (agregar/cambiar/quitar una línea), nunca place(). delivery_fee_cents viene de las
+// tarifas vigentes de la organización (internal/pricing): el carrito ya muestra el domicilio.
 func (q *Queries) RecalcCartAmounts(ctx context.Context, arg RecalcCartAmountsParams) (Order, error) {
 	row := q.db.QueryRow(ctx, recalcCartAmounts,
 		arg.SubtotalCents,
+		arg.DeliveryFeeCents,
 		arg.TotalCents,
 		arg.ID,
 		arg.OrganizationID,
@@ -524,6 +563,10 @@ func (q *Queries) RecalcCartAmounts(ctx context.Context, arg RecalcCartAmountsPa
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.PromotionID,
+		&i.SubtotalLocalCents,
+		&i.PlatformFeeCents,
+		&i.CourierFeeCents,
+		&i.PricingSnapshot,
 	)
 	return i, err
 }
@@ -532,7 +575,7 @@ const removePromotionFromOrder = `-- name: RemovePromotionFromOrder :one
 UPDATE orders
 SET promotion_id = NULL, discount_cents = 0, total_cents = subtotal_cents + delivery_fee_cents, updated_at = now()
 WHERE id = $1 AND organization_id = $2 AND status = 'draft'
-RETURNING id, organization_id, customer_id, status, subtotal_cents, discount_cents, delivery_fee_cents, total_cents, placed_at, status_changed_at, created_at, updated_at, promotion_id
+RETURNING id, organization_id, customer_id, status, subtotal_cents, discount_cents, delivery_fee_cents, total_cents, placed_at, status_changed_at, created_at, updated_at, promotion_id, subtotal_local_cents, platform_fee_cents, courier_fee_cents, pricing_snapshot
 `
 
 type RemovePromotionFromOrderParams struct {
@@ -559,22 +602,34 @@ func (q *Queries) RemovePromotionFromOrder(ctx context.Context, arg RemovePromot
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.PromotionID,
+		&i.SubtotalLocalCents,
+		&i.PlatformFeeCents,
+		&i.CourierFeeCents,
+		&i.PricingSnapshot,
 	)
 	return i, err
 }
 
 const setOrderAmounts = `-- name: SetOrderAmounts :one
 UPDATE orders
-SET subtotal_cents = $1, total_cents = $2, updated_at = now()
-WHERE id = $3 AND organization_id = $4
-RETURNING id, organization_id, customer_id, status, subtotal_cents, discount_cents, delivery_fee_cents, total_cents, placed_at, status_changed_at, created_at, updated_at, promotion_id
+SET subtotal_cents = $1, subtotal_local_cents = $2,
+    platform_fee_cents = $3, delivery_fee_cents = $4,
+    courier_fee_cents = $5, pricing_snapshot = $6,
+    total_cents = $7, updated_at = now()
+WHERE id = $8 AND organization_id = $9
+RETURNING id, organization_id, customer_id, status, subtotal_cents, discount_cents, delivery_fee_cents, total_cents, placed_at, status_changed_at, created_at, updated_at, promotion_id, subtotal_local_cents, platform_fee_cents, courier_fee_cents, pricing_snapshot
 `
 
 type SetOrderAmountsParams struct {
-	SubtotalCents  int32
-	TotalCents     int32
-	ID             uuid.UUID
-	OrganizationID uuid.UUID
+	SubtotalCents      int32
+	SubtotalLocalCents int32
+	PlatformFeeCents   int32
+	DeliveryFeeCents   int32
+	CourierFeeCents    int32
+	PricingSnapshot    []byte
+	TotalCents         int32
+	ID                 uuid.UUID
+	OrganizationID     uuid.UUID
 }
 
 // Recalcula subtotal_cents y total_cents SIN tocar discount_cents/promotion_id (a diferencia de
@@ -582,9 +637,17 @@ type SetOrderAmountsParams struct {
 // promoción (eso ya la habría borrado), así que esto es sobre todo una confirmación. total_cents
 // ya viene calculado desde Go (subtotal - descuento + envío, nunca negativo) — la aritmética de
 // negocio vive ahí, no en SQL.
+// Además congela lo que el pago necesita (docs/pagos.md §8): subtotal local (lo del restaurante),
+// comisión de la plataforma, domicilio y la parte de él que se queda la plataforma, y las tarifas
+// con que se calculó todo (pricing_snapshot).
 func (q *Queries) SetOrderAmounts(ctx context.Context, arg SetOrderAmountsParams) (Order, error) {
 	row := q.db.QueryRow(ctx, setOrderAmounts,
 		arg.SubtotalCents,
+		arg.SubtotalLocalCents,
+		arg.PlatformFeeCents,
+		arg.DeliveryFeeCents,
+		arg.CourierFeeCents,
+		arg.PricingSnapshot,
 		arg.TotalCents,
 		arg.ID,
 		arg.OrganizationID,
@@ -604,6 +667,10 @@ func (q *Queries) SetOrderAmounts(ctx context.Context, arg SetOrderAmountsParams
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.PromotionID,
+		&i.SubtotalLocalCents,
+		&i.PlatformFeeCents,
+		&i.CourierFeeCents,
+		&i.PricingSnapshot,
 	)
 	return i, err
 }
@@ -621,6 +688,18 @@ func (q *Queries) SumOrderItems(ctx context.Context, orderID uuid.UUID) (int64, 
 	return column_1, err
 }
 
+const sumOrderItemsLocal = `-- name: SumOrderItemsLocal :one
+SELECT COALESCE(sum(unit_local_total_cents::bigint * quantity), 0)::bigint FROM order_items WHERE order_id = $1
+`
+
+// La parte del restaurante en las líneas del pedido (precio local × cantidad).
+func (q *Queries) SumOrderItemsLocal(ctx context.Context, orderID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, sumOrderItemsLocal, orderID)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const transitionOrder = `-- name: TransitionOrder :one
 UPDATE orders
 SET status = $1,
@@ -628,7 +707,7 @@ SET status = $1,
     placed_at = CASE WHEN $2::boolean THEN now() ELSE placed_at END,
     updated_at = now()
 WHERE id = $3 AND organization_id = $4 AND status = ANY($5::text[])
-RETURNING id, organization_id, customer_id, status, subtotal_cents, discount_cents, delivery_fee_cents, total_cents, placed_at, status_changed_at, created_at, updated_at, promotion_id
+RETURNING id, organization_id, customer_id, status, subtotal_cents, discount_cents, delivery_fee_cents, total_cents, placed_at, status_changed_at, created_at, updated_at, promotion_id, subtotal_local_cents, platform_fee_cents, courier_fee_cents, pricing_snapshot
 `
 
 type TransitionOrderParams struct {
@@ -665,6 +744,10 @@ func (q *Queries) TransitionOrder(ctx context.Context, arg TransitionOrderParams
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.PromotionID,
+		&i.SubtotalLocalCents,
+		&i.PlatformFeeCents,
+		&i.CourierFeeCents,
+		&i.PricingSnapshot,
 	)
 	return i, err
 }
@@ -673,7 +756,7 @@ const updateOrderItemQuantity = `-- name: UpdateOrderItemQuantity :one
 UPDATE order_items
 SET quantity = $1, line_total_cents = unit_total_cents * $1::int, updated_at = now()
 WHERE id = $2 AND order_id = $3 AND organization_id = $4
-RETURNING id, order_id, organization_id, product_variant_id, name_snapshot, unit_price_cents_snapshot, modifiers_snapshot, unit_total_cents, quantity, line_total_cents, created_at, updated_at
+RETURNING id, order_id, organization_id, product_variant_id, name_snapshot, unit_price_cents_snapshot, modifiers_snapshot, unit_total_cents, quantity, line_total_cents, created_at, updated_at, unit_local_total_cents, platform_fee_bps
 `
 
 type UpdateOrderItemQuantityParams struct {
@@ -704,6 +787,8 @@ func (q *Queries) UpdateOrderItemQuantity(ctx context.Context, arg UpdateOrderIt
 		&i.LineTotalCents,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.UnitLocalTotalCents,
+		&i.PlatformFeeBps,
 	)
 	return i, err
 }

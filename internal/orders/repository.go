@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/domicilia/domicilia-core/internal/platform/db"
+	"github.com/domicilia/domicilia-core/internal/pricing"
 	"github.com/domicilia/domicilia-core/internal/store"
 )
 
@@ -40,14 +41,17 @@ func toOrderBase(o store.Order) Order {
 	}
 	return Order{
 		ID: o.ID, OrganizationID: o.OrganizationID, CustomerID: o.CustomerID, Status: Status(o.Status),
-		Items:            []Item{}, // nunca nil: mismo motivo que catalog.Product.Variants — ver su comentario.
-		SubtotalCents:    o.SubtotalCents,
-		DiscountCents:    o.DiscountCents,
-		DeliveryFeeCents: o.DeliveryFeeCents,
-		TotalCents:       o.TotalCents,
-		PromotionID:      promotionID,
-		PlacedAt:         timePtr(o.PlacedAt),
-		CreatedAt:        o.CreatedAt, UpdatedAt: o.UpdatedAt,
+		Items:              []Item{}, // nunca nil: mismo motivo que catalog.Product.Variants — ver su comentario.
+		SubtotalCents:      o.SubtotalCents,
+		DiscountCents:      o.DiscountCents,
+		DeliveryFeeCents:   o.DeliveryFeeCents,
+		TotalCents:         o.TotalCents,
+		SubtotalLocalCents: o.SubtotalLocalCents,
+		PlatformFeeCents:   o.PlatformFeeCents,
+		CourierFeeCents:    o.CourierFeeCents,
+		PromotionID:        promotionID,
+		PlacedAt:           timePtr(o.PlacedAt),
+		CreatedAt:          o.CreatedAt, UpdatedAt: o.UpdatedAt,
 	}
 }
 
@@ -166,14 +170,19 @@ func (r *pgRepository) ListByCustomer(ctx context.Context, customerID uuid.UUID,
 // aplicada (ver RecalcCartAmounts): la llaman las mutaciones del carrito (agregar/cambiar/quitar
 // una línea), nunca place(). Sin costo de envío todavía (otra ronda): total_cents = subtotal_cents
 // por ahora.
-func recalcCartAmounts(ctx context.Context, q *store.Queries, orgID, orderID uuid.UUID) (store.Order, error) {
+func recalcCartAmounts(ctx context.Context, q *store.Queries, orgID, orderID uuid.UUID, deliveryFeeCents int32) (store.Order, error) {
 	sum, err := q.SumOrderItems(ctx, orderID)
 	if err != nil {
 		return store.Order{}, fmt.Errorf("orders: sumar líneas: %w", err)
 	}
 	subtotal := int32(sum) //nolint:gosec // la suma de hasta 100 líneas de hasta 100M c/u no desborda int32 en la práctica
+	delivery := deliveryFeeCents
+	if subtotal == 0 {
+		delivery = 0 // un carrito vacío no cobra domicilio
+	}
 	row, err := q.RecalcCartAmounts(ctx, store.RecalcCartAmountsParams{
-		ID: orderID, OrganizationID: orgID, SubtotalCents: subtotal, TotalCents: subtotal,
+		ID: orderID, OrganizationID: orgID, SubtotalCents: subtotal, DeliveryFeeCents: delivery,
+		TotalCents: subtotal + delivery,
 	})
 	if err != nil {
 		return store.Order{}, fmt.Errorf("orders: fijar montos: %w", err)
@@ -184,7 +193,7 @@ func recalcCartAmounts(ctx context.Context, q *store.Queries, orgID, orderID uui
 // finalizeAmounts reconfirma subtotal_cents desde las líneas reales al confirmar el carrito
 // (place) SIN tocar discount_cents/promotion_id (a diferencia de recalcCartAmounts) — ya no
 // pudieron cambiar desde que se aplicó una promoción, eso ya la habría borrado.
-func finalizeAmounts(ctx context.Context, q *store.Queries, orgID, orderID uuid.UUID) (store.Order, error) {
+func finalizeAmounts(ctx context.Context, q *store.Queries, orgID, orderID uuid.UUID, rates pricing.Rates) (store.Order, error) {
 	current, err := q.GetOrder(ctx, store.GetOrderParams{ID: orderID, OrganizationID: orgID})
 	if err != nil {
 		return store.Order{}, fmt.Errorf("orders: leer pedido para confirmar montos: %w", err)
@@ -193,13 +202,37 @@ func finalizeAmounts(ctx context.Context, q *store.Queries, orgID, orderID uuid.
 	if err != nil {
 		return store.Order{}, fmt.Errorf("orders: sumar líneas: %w", err)
 	}
+	localSum, err := q.SumOrderItemsLocal(ctx, orderID)
+	if err != nil {
+		return store.Order{}, fmt.Errorf("orders: sumar parte local: %w", err)
+	}
 	subtotal := int32(sum) //nolint:gosec // la suma de hasta 100 líneas de hasta 100M c/u no desborda int32 en la práctica
-	total := subtotal - current.DiscountCents + current.DeliveryFeeCents
+	// El domicilio se fija con las tarifas vigentes al confirmar (puede haber cambiado desde que
+	// se armó el carrito) y desde aquí queda congelado.
+	split := rates.SplitFor(pricing.OrderAmounts{
+		SubtotalCents: sum, SubtotalLocalCents: localSum, DiscountCents: int64(current.DiscountCents),
+		DeliveryFeeCents: int64(rates.DeliveryFeeCents),
+	})
+	total := subtotal - current.DiscountCents + rates.DeliveryFeeCents
 	if total < 0 {
 		total = 0
 	}
+	snapshot, err := json.Marshal(map[string]any{
+		"platform_fee_bps": rates.PlatformFeeBps, "promo_platform_fee_bps": rates.PromoPlatformFeeBps,
+		"courier_fee_bps": rates.CourierFeeBps, "delivery_fee_cents": rates.DeliveryFeeCents,
+		"gateway_plan": rates.Plan, "split_enabled": rates.SplitEnabled, "split": split,
+	})
+	if err != nil {
+		return store.Order{}, fmt.Errorf("orders: codificar tarifas: %w", err)
+	}
 	row, err := q.SetOrderAmounts(ctx, store.SetOrderAmountsParams{
-		ID: orderID, OrganizationID: orgID, SubtotalCents: subtotal, TotalCents: total,
+		ID: orderID, OrganizationID: orgID, SubtotalCents: subtotal,
+		SubtotalLocalCents: int32(localSum),               //nolint:gosec // acotado como el subtotal
+		PlatformFeeCents:   int32(split.PlatformFeeCents), //nolint:gosec
+		DeliveryFeeCents:   rates.DeliveryFeeCents,
+		CourierFeeCents:    int32(split.CourierFeeCents), //nolint:gosec
+		PricingSnapshot:    snapshot,
+		TotalCents:         total,
 	})
 	if err != nil {
 		return store.Order{}, fmt.Errorf("orders: fijar montos: %w", err)
@@ -207,7 +240,7 @@ func finalizeAmounts(ctx context.Context, q *store.Queries, orgID, orderID uuid.
 	return row, nil
 }
 
-func (r *pgRepository) AddItem(ctx context.Context, orgID, orderID uuid.UUID, item NewItem) (Order, error) {
+func (r *pgRepository) AddItem(ctx context.Context, orgID, orderID uuid.UUID, item NewItem, deliveryFeeCents int32) (Order, error) {
 	var out Order
 	err := db.InTx(ctx, r.pool, func(tx pgx.Tx) error {
 		q := r.q.WithTx(tx)
@@ -223,10 +256,11 @@ func (r *pgRepository) AddItem(ctx context.Context, orgID, orderID uuid.UUID, it
 			OrderID: orderID, OrganizationID: orgID, ProductVariantID: variantID, NameSnapshot: item.Name,
 			UnitPriceCentsSnapshot: item.UnitPriceCents, ModifiersSnapshot: mods, UnitTotalCents: item.UnitTotalCents,
 			Quantity: int32(item.Quantity), LineTotalCents: item.LineTotalCents, //nolint:gosec // acotado por validateQuantity
+			UnitLocalTotalCents: item.UnitLocalTotalCents, PlatformFeeBps: item.PlatformFeeBps,
 		}); err != nil {
 			return fmt.Errorf("orders: agregar línea: %w", err)
 		}
-		row, err := recalcCartAmounts(ctx, q, orgID, orderID)
+		row, err := recalcCartAmounts(ctx, q, orgID, orderID, deliveryFeeCents)
 		if err != nil {
 			return err
 		}
@@ -236,7 +270,7 @@ func (r *pgRepository) AddItem(ctx context.Context, orgID, orderID uuid.UUID, it
 	return out, err
 }
 
-func (r *pgRepository) UpdateItemQuantity(ctx context.Context, orgID, orderID, itemID uuid.UUID, quantity int) (Order, error) {
+func (r *pgRepository) UpdateItemQuantity(ctx context.Context, orgID, orderID, itemID uuid.UUID, quantity int, deliveryFeeCents int32) (Order, error) {
 	var out Order
 	err := db.InTx(ctx, r.pool, func(tx pgx.Tx) error {
 		q := r.q.WithTx(tx)
@@ -248,7 +282,7 @@ func (r *pgRepository) UpdateItemQuantity(ctx context.Context, orgID, orderID, i
 			}
 			return fmt.Errorf("orders: cambiar cantidad: %w", err)
 		}
-		row, err := recalcCartAmounts(ctx, q, orgID, orderID)
+		row, err := recalcCartAmounts(ctx, q, orgID, orderID, deliveryFeeCents)
 		if err != nil {
 			return err
 		}
@@ -258,7 +292,7 @@ func (r *pgRepository) UpdateItemQuantity(ctx context.Context, orgID, orderID, i
 	return out, err
 }
 
-func (r *pgRepository) RemoveItem(ctx context.Context, orgID, orderID, itemID uuid.UUID) (Order, error) {
+func (r *pgRepository) RemoveItem(ctx context.Context, orgID, orderID, itemID uuid.UUID, deliveryFeeCents int32) (Order, error) {
 	var out Order
 	err := db.InTx(ctx, r.pool, func(tx pgx.Tx) error {
 		q := r.q.WithTx(tx)
@@ -269,7 +303,7 @@ func (r *pgRepository) RemoveItem(ctx context.Context, orgID, orderID, itemID uu
 		if n == 0 {
 			return ErrItemNotFound
 		}
-		row, err := recalcCartAmounts(ctx, q, orgID, orderID)
+		row, err := recalcCartAmounts(ctx, q, orgID, orderID, deliveryFeeCents)
 		if err != nil {
 			return err
 		}
@@ -279,12 +313,12 @@ func (r *pgRepository) RemoveItem(ctx context.Context, orgID, orderID, itemID uu
 	return out, err
 }
 
-func (r *pgRepository) Transition(ctx context.Context, orgID, id uuid.UUID, op Operation, place bool) (Order, error) {
+func (r *pgRepository) Transition(ctx context.Context, orgID, id uuid.UUID, op Operation, place *pricing.Rates) (Order, error) {
 	var out Order
 	err := db.InTx(ctx, r.pool, func(tx pgx.Tx) error {
 		q := r.q.WithTx(tx)
-		if place {
-			if _, err := finalizeAmounts(ctx, q, orgID, id); err != nil {
+		if place != nil {
+			if _, err := finalizeAmounts(ctx, q, orgID, id, *place); err != nil {
 				return err
 			}
 		}
@@ -293,7 +327,7 @@ func (r *pgRepository) Transition(ctx context.Context, orgID, id uuid.UUID, op O
 			fromStatuses[i] = string(s)
 		}
 		row, err := q.TransitionOrder(ctx, store.TransitionOrderParams{
-			Status: string(op.To), SetPlacedAt: place, ID: id, OrganizationID: orgID, FromStatuses: fromStatuses,
+			Status: string(op.To), SetPlacedAt: place != nil, ID: id, OrganizationID: orgID, FromStatuses: fromStatuses,
 		})
 		if db.IsNoRows(err) {
 			// No coincidió ningún estado de origen: o no existe, o está en otro estado.

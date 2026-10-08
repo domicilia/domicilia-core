@@ -134,9 +134,25 @@ type Product struct {
 	// Channels es dónde se publica: 'ecommerce' lo hace visible en el feed público
 	// (GET /v1/public/products), nunca is_active solo — una organización tiene que elegirlo a
 	// propósito. 'whatsapp' queda reservado para cuando el agente de WhatsApp venda productos.
-	Channels  []string  `json:"channels"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Channels []string `json:"channels"`
+	// PromoDiscountBps es el descuento de promoción que el restaurante da sobre su precio local
+	// (2000 = 20 %); 0 = sin promoción. Con promoción, la comisión de la plataforma baja a la de
+	// promoción (internal/pricing, docs/pagos.md §8). Los precios de variantes y modificadores son
+	// SIEMPRE el precio local; en las lecturas públicas se devuelven ya publicados.
+	PromoDiscountBps int32     `json:"promo_discount_bps"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+// maxPromoDiscountBps acota el descuento de promoción (90 %): un 100 % regalaría el producto.
+const maxPromoDiscountBps = 9000
+
+// validatePromoDiscount exige un descuento entre 0 y 90 %.
+func validatePromoDiscount(bps int32) error {
+	if bps < 0 || bps > maxPromoDiscountBps {
+		return apperr.Invalid("promo_discount_bps debe estar entre 0 y " + strconv.Itoa(maxPromoDiscountBps))
+	}
+	return nil
 }
 
 // ModifierOption es una opción dentro de un grupo (p. ej. "Queso extra", "+$3.000").
@@ -385,8 +401,9 @@ type NewProduct struct {
 	ModifierGroupIDs []uuid.UUID
 	// Ingredients y Channels nil se guardan como "sin nada" (arreglo vacío) — un producto nuevo
 	// nunca se publica solo, ver el comentario de Product.Channels.
-	Ingredients []string
-	Channels    []string
+	Ingredients      []string
+	Channels         []string
+	PromoDiscountBps int32
 }
 
 // ProductPatch es un cambio parcial: un puntero/slice nil no toca el campo. En CategoryID,
@@ -410,6 +427,8 @@ type ProductPatch struct {
 	// los canales sin desactivar el producto.
 	Ingredients *[]string
 	Channels    *[]string
+	// PromoDiscountBps nil no toca.
+	PromoDiscountBps *int32
 }
 
 // CategoryPatch es un cambio parcial de categoría. Ningún campo admite null: siempre puntero =
@@ -434,8 +453,13 @@ type FeedProduct struct {
 	Name                string     `json:"name"`
 	Description         *string    `json:"description"`
 	ImageURL            *string    `json:"image_url"`
-	// MinPriceCents es el precio de la variante activa más barata — "desde $X" en la tarjeta.
+	// MinPriceCents es el precio PUBLICADO de la variante activa más barata — "desde $X" en la
+	// tarjeta —, ya con la comisión de la plataforma y la promoción del producto, si tiene.
 	MinPriceCents int32 `json:"min_price_cents"`
+	// PromoDiscountBps > 0: el producto está en promoción. RegularMinPriceCents es entonces el
+	// precio publicado SIN el descuento (para mostrarlo tachado).
+	PromoDiscountBps     int32 `json:"promo_discount_bps"`
+	RegularMinPriceCents int32 `json:"regular_min_price_cents"`
 }
 
 // PublicFeedFilter filtra el feed público. Todo opcional: sin nada, trae de todas las

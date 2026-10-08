@@ -72,10 +72,10 @@ func TestAgregarAlCarrito(t *testing.T) {
 			t.Fatalf("items = %v", items)
 		}
 		line := items[0].(map[string]any)
-		if line["unit_price_cents"] != float64(3000) || line["quantity"] != float64(2) || line["line_total_cents"] != float64(6000) {
+		if line["unit_price_cents"] != float64(3300) || line["quantity"] != float64(2) || line["line_total_cents"] != float64(6600) {
 			t.Fatalf("línea = %v", line)
 		}
-		if cart["subtotal_cents"] != float64(6000) || cart["total_cents"] != float64(6000) {
+		if cart["subtotal_cents"] != float64(6600) || cart["total_cents"] != float64(6600) {
 			t.Fatalf("carrito = %v", cart)
 		}
 	})
@@ -153,7 +153,7 @@ func TestModificadoresObligatoriosEnElCarrito(t *testing.T) {
 		}, &cliente)
 		want(t, rec, http.StatusCreated)
 		line := jsonMap(t, rec)["items"].([]any)[0].(map[string]any)
-		if line["unit_total_cents"] != float64(7000) || line["line_total_cents"] != float64(7000) {
+		if line["unit_total_cents"] != float64(7700) || line["line_total_cents"] != float64(7700) {
 			t.Fatalf("línea = %v", line)
 		}
 		mods := line["modifiers"].([]any)
@@ -193,7 +193,7 @@ func TestCambiarCantidadYQuitarLinea(t *testing.T) {
 		want(t, rec, http.StatusOK)
 		out := jsonMap(t, rec)
 		line := out["items"].([]any)[0].(map[string]any)
-		if line["quantity"] != float64(3) || line["line_total_cents"] != float64(9000) || out["subtotal_cents"] != float64(9000) {
+		if line["quantity"] != float64(3) || line["line_total_cents"] != float64(9900) || out["subtotal_cents"] != float64(9900) {
 			t.Fatalf("carrito = %v", out)
 		}
 	})
@@ -251,7 +251,7 @@ func TestConfirmarElCarrito(t *testing.T) {
 		rec2 := h.do(http.MethodGet, ordersOrgURL(o, "/"+orderID), nil, &admin)
 		want(t, rec2, http.StatusOK)
 		out := jsonMap(t, rec2)
-		if out["subtotal_cents"] != float64(6000) {
+		if out["subtotal_cents"] != float64(6600) {
 			t.Fatalf("el pedido cambió de precio tras editar el menú: subtotal_cents = %v", out["subtotal_cents"])
 		}
 
@@ -282,15 +282,15 @@ func TestMaquinaDeEstadosDelPedido(t *testing.T) {
 
 	// El pago de verdad pasa por internal/payments: iniciarlo y que la pasarela lo confirme por
 	// su webhook — no por una ruta que "simula" el pago.
-	pay := jsonMap(t, h.do(http.MethodPost, ordersOrgURL(o, "/"+orderID+"/pay"), nil, &cliente))
+	_, pay, amount := startPayment(h, o, orderID, cliente, "card")
 	paymentID := pay["id"].(string)
-	rec := h.postPaymentWebhook(paymentID, "ref-001", "tx-001", "30.00", "Aceptada", nil)
+	rec := h.postPaymentWebhook(paymentID, "ref-001", "tx-001", amount, "Aceptada", nil)
 	want(t, rec, http.StatusOK)
 	if got := jsonMap(t, h.do(http.MethodGet, ordersOrgURL(o, "/"+orderID), nil, &admin))["status"]; got != "confirmed" {
 		t.Fatalf("estado tras el webhook = %v, quería confirmed", got)
 	}
 	// El mismo evento reentregado (la pasarela promete "al menos una vez") no rompe nada.
-	want(t, h.postPaymentWebhook(paymentID, "ref-001", "tx-001", "30.00", "Aceptada", nil), http.StatusOK)
+	want(t, h.postPaymentWebhook(paymentID, "ref-001", "tx-001", amount, "Aceptada", nil), http.StatusOK)
 
 	want(t, h.do(http.MethodPost, ordersOrgURL(o, "/"+orderID+"/accept"), nil, &empleado), http.StatusOK)
 	want(t, h.do(http.MethodPost, ordersOrgURL(o, "/"+orderID+"/start-preparing"), nil, &empleado), http.StatusOK)
@@ -388,10 +388,10 @@ func TestMisCarritos(t *testing.T) {
 	for _, c := range carts {
 		byOrg[c["organization_name"].(string)] = c
 	}
-	if byOrg["Acme"]["item_count"] != float64(1) || byOrg["Acme"]["total_cents"] != float64(3000) {
+	if byOrg["Acme"]["item_count"] != float64(1) || byOrg["Acme"]["total_cents"] != float64(3300) {
 		t.Fatalf("carrito de Acme = %v", byOrg["Acme"])
 	}
-	if byOrg["Otra"]["item_count"] != float64(1) || byOrg["Otra"]["total_cents"] != float64(40000) {
+	if byOrg["Otra"]["item_count"] != float64(1) || byOrg["Otra"]["total_cents"] != float64(44000) {
 		t.Fatalf("carrito de Otra = %v", byOrg["Otra"])
 	}
 

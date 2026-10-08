@@ -23,6 +23,7 @@ import (
 
 	"github.com/domicilia/domicilia-core/internal/catalog"
 	"github.com/domicilia/domicilia-core/internal/platform/apperr"
+	"github.com/domicilia/domicilia-core/internal/pricing"
 )
 
 // Errores del repositorio que el servicio traduce a errores de negocio.
@@ -130,6 +131,12 @@ type Order struct {
 	DiscountCents    int32     `json:"discount_cents"`
 	DeliveryFeeCents int32     `json:"delivery_fee_cents"`
 	TotalCents       int32     `json:"total_cents"`
+	// Se congelan al confirmar (place), docs/pagos.md §8: la parte del restaurante (precios
+	// locales), la comisión de la plataforma sobre los productos y la parte del domicilio que se
+	// queda la plataforma. En el carrito (draft) valen 0.
+	SubtotalLocalCents int32 `json:"subtotal_local_cents"`
+	PlatformFeeCents   int32 `json:"platform_fee_cents"`
+	CourierFeeCents    int32 `json:"courier_fee_cents"`
 	// PromotionID es el cupón aplicado al carrito, si hay uno — ver internal/promotions. Se borra
 	// solo (junto con DiscountCents) en cuanto el carrito vuelve a editarse.
 	PromotionID *uuid.UUID `json:"promotion_id"`
@@ -168,7 +175,7 @@ type CatalogReader interface {
 // resolveLine valida la variante y las opciones elegidas contra el catálogo real y arma el
 // snapshot de la línea. Nunca confía en un nombre o un precio que venga en la petición — todo
 // sale de leer el producto.
-func resolveLine(ctx context.Context, reader CatalogReader, orgID uuid.UUID, in AddItemInput) (NewItem, error) {
+func resolveLine(ctx context.Context, reader CatalogReader, rates pricing.Rates, orgID uuid.UUID, in AddItemInput) (NewItem, error) {
 	if err := validateQuantity(in.Quantity); err != nil {
 		return NewItem{}, err
 	}
@@ -199,18 +206,32 @@ func resolveLine(ctx context.Context, reader CatalogReader, orgID uuid.UUID, in 
 		return NewItem{}, err
 	}
 
-	unitTotal := variant.PriceCents
-	for _, m := range modifiers {
-		unitTotal += m.PriceDeltaCents
+	// Precios del catálogo = precio LOCAL del restaurante. La línea guarda el precio PUBLICADO
+	// (local + comisión, con la promoción del producto si tiene) y, aparte, la parte local: así
+	// el reparto sale de las líneas reales, no de un porcentaje aplicado al final.
+	deltas := make([]int64, len(modifiers))
+	for i, m := range modifiers {
+		deltas[i] = int64(m.PriceDeltaCents)
+	}
+	unit := rates.PriceUnit(int64(variant.PriceCents), deltas, product.PromoDiscountBps)
+	for i := range modifiers {
+		modifiers[i].PriceDeltaCents = int32(unit.ModifierCents[i]) //nolint:gosec // acotado por maxPriceCents
+	}
+	unitTotal := int32(unit.TotalCents) //nolint:gosec // acotado por maxPriceCents
+	name := product.Name + " — " + variant.Name
+	if product.PromoDiscountBps > 0 {
+		name += " (promoción)"
 	}
 	return NewItem{
-		ProductVariantID: &variant.ID,
-		Name:             product.Name + " — " + variant.Name,
-		UnitPriceCents:   variant.PriceCents,
-		Modifiers:        modifiers,
-		UnitTotalCents:   unitTotal,
-		Quantity:         in.Quantity,
-		LineTotalCents:   unitTotal * int32(in.Quantity), //nolint:gosec // quantity acotado a 50
+		ProductVariantID:    &variant.ID,
+		Name:                name,
+		UnitPriceCents:      int32(unit.VariantCents), //nolint:gosec
+		Modifiers:           modifiers,
+		UnitTotalCents:      unitTotal,
+		UnitLocalTotalCents: int32(unit.LocalCents), //nolint:gosec
+		PlatformFeeBps:      unit.FeeBps,
+		Quantity:            in.Quantity,
+		LineTotalCents:      unitTotal * int32(in.Quantity), //nolint:gosec // quantity acotado a 50
 	}, nil
 }
 
@@ -266,8 +287,12 @@ type NewItem struct {
 	UnitPriceCents   int32
 	Modifiers        []ModifierSnapshot
 	UnitTotalCents   int32
-	Quantity         int
-	LineTotalCents   int32
+	// UnitLocalTotalCents es la parte del restaurante en UnitTotalCents (su precio local, ya con
+	// el descuento de promoción); PlatformFeeBps, la comisión que se aplicó.
+	UnitLocalTotalCents int32
+	PlatformFeeBps      int32
+	Quantity            int
+	LineTotalCents      int32
 }
 
 // DraftSummary es un carrito abierto del cliente, sin el detalle de sus líneas — lo que necesita
@@ -303,13 +328,15 @@ type Repository interface {
 	ListMyDrafts(ctx context.Context, customerID uuid.UUID) ([]DraftSummary, error)
 	// AddItem, UpdateItemQuantity y RemoveItem devuelven el pedido completo ya recalculado
 	// (nunca solo la línea): así el llamador siempre tiene el total al día.
-	AddItem(ctx context.Context, orgID, orderID uuid.UUID, item NewItem) (Order, error)
-	UpdateItemQuantity(ctx context.Context, orgID, orderID, itemID uuid.UUID, quantity int) (Order, error)
-	RemoveItem(ctx context.Context, orgID, orderID, itemID uuid.UUID) (Order, error)
+	// deliveryFeeCents es el domicilio vigente (internal/pricing): el carrito ya lo muestra.
+	AddItem(ctx context.Context, orgID, orderID uuid.UUID, item NewItem, deliveryFeeCents int32) (Order, error)
+	UpdateItemQuantity(ctx context.Context, orgID, orderID, itemID uuid.UUID, quantity int, deliveryFeeCents int32) (Order, error)
+	RemoveItem(ctx context.Context, orgID, orderID, itemID uuid.UUID, deliveryFeeCents int32) (Order, error)
 	// Transition aplica la operación si el estado actual la permite; si no, devuelve
-	// *TransitionError (ErrInvalidTransition). place recalcula subtotal_cents/total_cents
-	// desde las líneas reales ANTES de aplicar la transición, en la misma llamada.
-	Transition(ctx context.Context, orgID, id uuid.UUID, op Operation, place bool) (Order, error)
+	// *TransitionError (ErrInvalidTransition). place != nil (solo al confirmar el carrito)
+	// recalcula y CONGELA los montos con esas tarifas ANTES de aplicar la transición, en la misma
+	// transacción: subtotal, parte local, comisión, domicilio y la copia de tarifas.
+	Transition(ctx context.Context, orgID, id uuid.UUID, op Operation, place *pricing.Rates) (Order, error)
 	// ApplyPromotion y RemovePromotion los usa internal/promotions (a través de OrdersGateway),
 	// nunca un actor directamente — ver el comentario del paquete promotions. Ambos exigen que el
 	// pedido siga en draft (lo exige la consulta, no el llamador) y devuelven ErrNotFound si no

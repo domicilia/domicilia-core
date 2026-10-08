@@ -77,6 +77,7 @@ type harness struct {
 	handler *echo.Echo
 	idp     *fakeIDP
 	meta    *fakeMeta
+	epayco  *fakeEpayco
 	workers *app.Workers
 	// logs es todo lo que la aplicación escribió en su log: las pruebas comprueban que ahí nunca hay secretos.
 	logs syncBuffer
@@ -110,7 +111,7 @@ func newHarness(t *testing.T, opts ...func(*config.Config)) *harness {
 	must(t, pgtest.Reset(context.Background(), pool))
 
 	idp := &fakeIDP{pool: pool}
-	h := &harness{t: t, idp: idp, meta: newFakeMeta(t)}
+	h := &harness{t: t, idp: idp, meta: newFakeMeta(t), epayco: newFakeEpayco(t)}
 	now := func() time.Time {
 		if !h.clock.IsZero() {
 			return h.clock
@@ -132,6 +133,7 @@ func newHarness(t *testing.T, opts ...func(*config.Config)) *harness {
 		EpaycoPrivateKey: testEpaycoPrivateKey,
 		EpaycoCustomerID: testEpaycoCustomerID,
 		EpaycoTestMode:   true,
+		EpaycoApifyURL:   h.epayco.srv.URL,
 	}
 	for _, o := range opts {
 		o(&cfg)
@@ -158,7 +160,7 @@ func newHarnessWithMedia(t *testing.T, media catalog.MediaUploader, opts ...func
 	must(t, pgtest.Reset(context.Background(), pool))
 
 	idp := &fakeIDP{pool: pool}
-	h := &harness{t: t, idp: idp, meta: newFakeMeta(t)}
+	h := &harness{t: t, idp: idp, meta: newFakeMeta(t), epayco: newFakeEpayco(t)}
 	now := func() time.Time {
 		if !h.clock.IsZero() {
 			return h.clock
@@ -180,6 +182,7 @@ func newHarnessWithMedia(t *testing.T, media catalog.MediaUploader, opts ...func
 		EpaycoPrivateKey: testEpaycoPrivateKey,
 		EpaycoCustomerID: testEpaycoCustomerID,
 		EpaycoTestMode:   true,
+		EpaycoApifyURL:   h.epayco.srv.URL,
 	}
 	for _, o := range opts {
 		o(&cfg)

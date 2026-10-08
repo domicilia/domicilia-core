@@ -11,11 +11,14 @@ package payments
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/domicilia/domicilia-core/internal/pricing"
 )
 
 // Errores del repositorio y de Gateway.ParseWebhook que el servicio y el handler traducen a
@@ -48,6 +51,19 @@ type Payment struct {
 	Gateway        string    `json:"gateway"`
 	CheckoutURL    *string   `json:"checkout_url"`
 	FailureReason  *string   `json:"failure_reason"`
+	// Medio que declaró el cliente, base (lo que debe quedar tras la pasarela), costo de
+	// transacción que aceptó, plan con que se calculó y el desglose completo (docs/pagos.md §8).
+	Method              *string         `json:"method"`
+	BaseCents           *int32          `json:"base_cents"`
+	TransactionFeeCents int32           `json:"transaction_fee_cents"`
+	GatewayPlanCode     *string         `json:"gateway_plan_code"`
+	Breakdown           json.RawMessage `json:"breakdown"`
+	// SessionID es la sesión del checkout onpage de ePayco (checkout-v2).
+	SessionID *string `json:"session_id"`
+	// MethodUsed es lo que la pasarela dice que se usó (x_franchise); MethodMismatch, si no
+	// coincide con Method — para conciliación (docs/pagos.md §7.6).
+	MethodUsed     *string   `json:"method_used"`
+	MethodMismatch bool      `json:"method_mismatch"`
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
 }
@@ -65,6 +81,32 @@ type ChargeRequest struct {
 	ResponseURL     string // adonde vuelve el navegador del cliente tras pagar
 	ConfirmationURL string // nuestro webhook, servidor a servidor
 	TestMode        bool
+	// Method es el medio declarado por el cliente (va como extra para trazabilidad).
+	Method pricing.Method
+	// Split, si no es nil, reparte el cobro (ePayco split payments). nil = todo a la cuenta de
+	// la plataforma.
+	Split *SplitRequest
+}
+
+// SplitRequest es el reparto automático del cobro entre receptores (docs/pagos.md §8). La
+// plataforma es el receptor principal: recibe lo que no se asigna a otros.
+type SplitRequest struct {
+	Receivers []SplitReceiver
+}
+
+// SplitReceiver es un receptor secundario (el restaurante).
+type SplitReceiver struct {
+	MerchantID  string // P_CUST_ID_CLIENTE del receptor en ePayco
+	AmountCents int64
+}
+
+// SessionGateway es una pasarela que abre su checkout DENTRO de nuestra página (checkout onpage):
+// el servidor crea una sesión y el frontend la abre con el script de la pasarela. ePayco
+// checkout-v2 la exige (login + payment/session/create desde el servidor).
+type SessionGateway interface {
+	CreateSession(ctx context.Context, req ChargeRequest) (sessionID string, err error)
+	// TestMode dice si las sesiones se crean en modo de pruebas (el frontend lo necesita).
+	TestMode() bool
 }
 
 // WebhookEvent es un evento YA VALIDADO (firma/autenticidad comprobada con las credenciales de la
@@ -78,6 +120,14 @@ type WebhookEvent struct {
 	Succeeded     bool
 	FailureReason string
 	RawPayload    []byte
+	// AmountCents es el monto que la pasarela dice que cobró (0 = no lo informó). Si no coincide
+	// con el del pago, el pago NO se da por bueno.
+	AmountCents int64
+	// MethodUsed es el medio que la pasarela dice que se usó, ya traducido a pricing.Method ("" si
+	// no se pudo saber).
+	MethodUsed pricing.Method
+	// RawMethod es lo que mandó la pasarela tal cual (p. ej. x_franchise), para auditoría.
+	RawMethod string
 }
 
 // Gateway es la pasarela de pago. ePayco (paquete epayco) es la primera implementación.
@@ -96,8 +146,22 @@ type Gateway interface {
 }
 
 // Repository es lo que el servicio necesita de la base de datos.
+// NewPayment son los datos de un intento de cobro nuevo.
+type NewPayment struct {
+	OrderID, OrganizationID uuid.UUID
+	AmountCents             int32
+	Currency, Gateway       string
+	Method                  pricing.Method
+	BaseCents               int32
+	TransactionFeeCents     int32
+	GatewayPlanCode         string
+	Breakdown               []byte
+}
+
 type Repository interface {
-	Insert(ctx context.Context, orderID, orgID uuid.UUID, amountCents int32, currency, gateway string) (Payment, error)
+	Insert(ctx context.Context, n NewPayment) (Payment, error)
+	SetSession(ctx context.Context, id uuid.UUID, sessionID string) (Payment, error)
+	SetMethodUsed(ctx context.Context, id uuid.UUID, methodUsed string, mismatch bool) (Payment, error)
 	Get(ctx context.Context, orgID, id uuid.UUID) (Payment, error)
 	// GetByID lo usa el webhook: solo conoce el id que le mandamos como referencia, no la
 	// organización — mismo motivo que orders.Repository.GetOrderByID.

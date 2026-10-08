@@ -27,9 +27,10 @@ RETURNING *;
 -- ---------------------------------------------------------------------------
 
 -- name: InsertProduct :one
-INSERT INTO products (organization_id, category_id, name, description, image_url, position, ingredients, channels)
+INSERT INTO products (organization_id, category_id, name, description, image_url, position, ingredients, channels,
+                      promo_discount_bps)
 VALUES (@organization_id, sqlc.narg('category_id'), @name, sqlc.narg('description'), sqlc.narg('image_url'), @position,
-        @ingredients::text[], @channels::text[])
+        @ingredients::text[], @channels::text[], @promo_discount_bps)
 RETURNING *;
 
 -- name: GetProduct :one
@@ -62,6 +63,7 @@ SET category_id  = CASE WHEN @set_category::boolean THEN sqlc.narg('category_id'
     is_active    = COALESCE(sqlc.narg('is_active'), is_active),
     ingredients  = CASE WHEN @set_ingredients::boolean THEN @ingredients::text[] ELSE ingredients END,
     channels     = CASE WHEN @set_channels::boolean THEN @channels::text[] ELSE channels END,
+    promo_discount_bps = COALESCE(sqlc.narg('promo_discount_bps'), promo_discount_bps),
     updated_at   = now()
 WHERE id = @id AND organization_id = @organization_id
 RETURNING *;
@@ -188,7 +190,7 @@ VALUES (@product_id, @organization_id, @modifier_group_id, @position);
 -- name: ListPublicProducts :many
 SELECT p.id, p.organization_id, o.name AS organization_name, o.slug AS organization_slug,
        s.logo_url AS organization_logo_url, p.category_id, c.name AS category_name,
-       p.name, p.description, p.image_url, MIN(v.price_cents)::int AS min_price_cents
+       p.name, p.description, p.image_url, p.promo_discount_bps, MIN(v.price_cents)::int AS min_price_cents
 FROM products p
 JOIN organizations o ON o.id = p.organization_id
 LEFT JOIN organization_settings s ON s.organization_id = o.id
@@ -199,7 +201,8 @@ WHERE o.status = 'active' AND p.is_active AND 'ecommerce' = ANY(p.channels)
   AND (sqlc.narg('organization_slug')::text IS NULL OR o.slug = sqlc.narg('organization_slug'))
   AND (sqlc.narg('search')::text IS NULL OR p.name ILIKE '%' || sqlc.narg('search')::text || '%')
   AND (sqlc.narg('category')::text IS NULL OR c.name ILIKE sqlc.narg('category')::text)
-GROUP BY p.id, p.organization_id, o.name, o.slug, s.logo_url, p.category_id, c.name, p.name, p.description, p.image_url
+GROUP BY p.id, p.organization_id, o.name, o.slug, s.logo_url, p.category_id, c.name, p.name, p.description, p.image_url,
+         p.promo_discount_bps
 ORDER BY p.created_at DESC, p.id
 LIMIT @page_size OFFSET @page_offset;
 

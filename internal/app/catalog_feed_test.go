@@ -47,7 +47,7 @@ func TestFeedPublicoDeProductos(t *testing.T) {
 		names := map[string]bool{}
 		for _, it := range items {
 			names[it.(map[string]any)["organization_name"].(string)] = true
-			if it.(map[string]any)["name"] == "Margarita" && it.(map[string]any)["min_price_cents"] != float64(25000) {
+			if it.(map[string]any)["name"] == "Margarita" && it.(map[string]any)["min_price_cents"] != float64(27500) {
 				t.Fatalf("min_price_cents = %v", it)
 			}
 		}

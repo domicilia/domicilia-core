@@ -206,7 +206,7 @@ func (q *Queries) GetModifierGroupsByIDs(ctx context.Context, arg GetModifierGro
 }
 
 const getProduct = `-- name: GetProduct :one
-SELECT id, organization_id, category_id, name, description, image_url, position, is_active, created_at, updated_at, ingredients, channels FROM products WHERE id = $1 AND organization_id = $2
+SELECT id, organization_id, category_id, name, description, image_url, position, is_active, created_at, updated_at, ingredients, channels, promo_discount_bps FROM products WHERE id = $1 AND organization_id = $2
 `
 
 type GetProductParams struct {
@@ -230,6 +230,7 @@ func (q *Queries) GetProduct(ctx context.Context, arg GetProductParams) (Product
 		&i.UpdatedAt,
 		&i.Ingredients,
 		&i.Channels,
+		&i.PromoDiscountBps,
 	)
 	return i, err
 }
@@ -345,21 +346,23 @@ func (q *Queries) InsertModifierOption(ctx context.Context, arg InsertModifierOp
 
 const insertProduct = `-- name: InsertProduct :one
 
-INSERT INTO products (organization_id, category_id, name, description, image_url, position, ingredients, channels)
+INSERT INTO products (organization_id, category_id, name, description, image_url, position, ingredients, channels,
+                      promo_discount_bps)
 VALUES ($1, $2, $3, $4, $5, $6,
-        $7::text[], $8::text[])
-RETURNING id, organization_id, category_id, name, description, image_url, position, is_active, created_at, updated_at, ingredients, channels
+        $7::text[], $8::text[], $9)
+RETURNING id, organization_id, category_id, name, description, image_url, position, is_active, created_at, updated_at, ingredients, channels, promo_discount_bps
 `
 
 type InsertProductParams struct {
-	OrganizationID uuid.UUID
-	CategoryID     uuid.NullUUID
-	Name           string
-	Description    *string
-	ImageUrl       *string
-	Position       int32
-	Ingredients    []string
-	Channels       []string
+	OrganizationID   uuid.UUID
+	CategoryID       uuid.NullUUID
+	Name             string
+	Description      *string
+	ImageUrl         *string
+	Position         int32
+	Ingredients      []string
+	Channels         []string
+	PromoDiscountBps int32
 }
 
 // ---------------------------------------------------------------------------
@@ -375,6 +378,7 @@ func (q *Queries) InsertProduct(ctx context.Context, arg InsertProductParams) (P
 		arg.Position,
 		arg.Ingredients,
 		arg.Channels,
+		arg.PromoDiscountBps,
 	)
 	var i Product
 	err := row.Scan(
@@ -390,6 +394,7 @@ func (q *Queries) InsertProduct(ctx context.Context, arg InsertProductParams) (P
 		&i.UpdatedAt,
 		&i.Ingredients,
 		&i.Channels,
+		&i.PromoDiscountBps,
 	)
 	return i, err
 }
@@ -592,7 +597,7 @@ func (q *Queries) ListModifierOptionsByGroups(ctx context.Context, modifierGroup
 }
 
 const listProducts = `-- name: ListProducts :many
-SELECT id, organization_id, category_id, name, description, image_url, position, is_active, created_at, updated_at, ingredients, channels FROM products
+SELECT id, organization_id, category_id, name, description, image_url, position, is_active, created_at, updated_at, ingredients, channels, promo_discount_bps FROM products
 WHERE organization_id = $1
   AND ($2::uuid IS NULL OR category_id = $2)
 ORDER BY position, id
@@ -633,6 +638,7 @@ func (q *Queries) ListProducts(ctx context.Context, arg ListProductsParams) ([]P
 			&i.UpdatedAt,
 			&i.Ingredients,
 			&i.Channels,
+			&i.PromoDiscountBps,
 		); err != nil {
 			return nil, err
 		}
@@ -648,7 +654,7 @@ const listPublicProducts = `-- name: ListPublicProducts :many
 
 SELECT p.id, p.organization_id, o.name AS organization_name, o.slug AS organization_slug,
        s.logo_url AS organization_logo_url, p.category_id, c.name AS category_name,
-       p.name, p.description, p.image_url, MIN(v.price_cents)::int AS min_price_cents
+       p.name, p.description, p.image_url, p.promo_discount_bps, MIN(v.price_cents)::int AS min_price_cents
 FROM products p
 JOIN organizations o ON o.id = p.organization_id
 LEFT JOIN organization_settings s ON s.organization_id = o.id
@@ -659,7 +665,8 @@ WHERE o.status = 'active' AND p.is_active AND 'ecommerce' = ANY(p.channels)
   AND ($2::text IS NULL OR o.slug = $2)
   AND ($3::text IS NULL OR p.name ILIKE '%' || $3::text || '%')
   AND ($4::text IS NULL OR c.name ILIKE $4::text)
-GROUP BY p.id, p.organization_id, o.name, o.slug, s.logo_url, p.category_id, c.name, p.name, p.description, p.image_url
+GROUP BY p.id, p.organization_id, o.name, o.slug, s.logo_url, p.category_id, c.name, p.name, p.description, p.image_url,
+         p.promo_discount_bps
 ORDER BY p.created_at DESC, p.id
 LIMIT $6 OFFSET $5
 `
@@ -684,6 +691,7 @@ type ListPublicProductsRow struct {
 	Name                string
 	Description         *string
 	ImageUrl            *string
+	PromoDiscountBps    int32
 	MinPriceCents       int32
 }
 
@@ -727,6 +735,7 @@ func (q *Queries) ListPublicProducts(ctx context.Context, arg ListPublicProducts
 			&i.Name,
 			&i.Description,
 			&i.ImageUrl,
+			&i.PromoDiscountBps,
 			&i.MinPriceCents,
 		); err != nil {
 			return nil, err
@@ -921,27 +930,29 @@ SET category_id  = CASE WHEN $1::boolean THEN $2 ELSE category_id END,
     is_active    = COALESCE($9, is_active),
     ingredients  = CASE WHEN $10::boolean THEN $11::text[] ELSE ingredients END,
     channels     = CASE WHEN $12::boolean THEN $13::text[] ELSE channels END,
+    promo_discount_bps = COALESCE($14, promo_discount_bps),
     updated_at   = now()
-WHERE id = $14 AND organization_id = $15
-RETURNING id, organization_id, category_id, name, description, image_url, position, is_active, created_at, updated_at, ingredients, channels
+WHERE id = $15 AND organization_id = $16
+RETURNING id, organization_id, category_id, name, description, image_url, position, is_active, created_at, updated_at, ingredients, channels, promo_discount_bps
 `
 
 type UpdateProductParams struct {
-	SetCategory    bool
-	CategoryID     uuid.NullUUID
-	Name           *string
-	SetDescription bool
-	Description    *string
-	SetImage       bool
-	ImageUrl       *string
-	Position       *int32
-	IsActive       *bool
-	SetIngredients bool
-	Ingredients    []string
-	SetChannels    bool
-	Channels       []string
-	ID             uuid.UUID
-	OrganizationID uuid.UUID
+	SetCategory      bool
+	CategoryID       uuid.NullUUID
+	Name             *string
+	SetDescription   bool
+	Description      *string
+	SetImage         bool
+	ImageUrl         *string
+	Position         *int32
+	IsActive         *bool
+	SetIngredients   bool
+	Ingredients      []string
+	SetChannels      bool
+	Channels         []string
+	PromoDiscountBps *int32
+	ID               uuid.UUID
+	OrganizationID   uuid.UUID
 }
 
 // Cambio parcial: set_* distingue "no tocar" de "reemplazar" para los campos que no se pueden
@@ -964,6 +975,7 @@ func (q *Queries) UpdateProduct(ctx context.Context, arg UpdateProductParams) (P
 		arg.Ingredients,
 		arg.SetChannels,
 		arg.Channels,
+		arg.PromoDiscountBps,
 		arg.ID,
 		arg.OrganizationID,
 	)
@@ -981,6 +993,7 @@ func (q *Queries) UpdateProduct(ctx context.Context, arg UpdateProductParams) (P
 		&i.UpdatedAt,
 		&i.Ingredients,
 		&i.Channels,
+		&i.PromoDiscountBps,
 	)
 	return i, err
 }

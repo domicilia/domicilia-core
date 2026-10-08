@@ -138,6 +138,25 @@ type DriverApplication struct {
 	UpdatedAt   time.Time
 }
 
+type GatewayFeePlan struct {
+	Code                   string
+	Gateway                string
+	Name                   string
+	CardPercentBps         int32
+	CardFixedCents         int32
+	InternationalExtraBps  int32
+	WalletPercentBps       int32
+	WalletFixedCents       int32
+	PsePercentBps          int32
+	PseFixedCents          int32
+	PseSmallThresholdCents int32
+	PseSmallFixedCents     int32
+	VatBps                 int32
+	Notes                  *string
+	UpdatedBy              uuid.NullUUID
+	UpdatedAt              time.Time
+}
+
 type Inbox struct {
 	ID             uuid.UUID
 	OrganizationID uuid.UUID
@@ -214,19 +233,23 @@ type ModifierOption struct {
 }
 
 type Order struct {
-	ID               uuid.UUID
-	OrganizationID   uuid.UUID
-	CustomerID       uuid.UUID
-	Status           string
-	SubtotalCents    int32
-	DiscountCents    int32
-	DeliveryFeeCents int32
-	TotalCents       int32
-	PlacedAt         pgtype.Timestamptz
-	StatusChangedAt  pgtype.Timestamptz
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
-	PromotionID      uuid.NullUUID
+	ID                 uuid.UUID
+	OrganizationID     uuid.UUID
+	CustomerID         uuid.UUID
+	Status             string
+	SubtotalCents      int32
+	DiscountCents      int32
+	DeliveryFeeCents   int32
+	TotalCents         int32
+	PlacedAt           pgtype.Timestamptz
+	StatusChangedAt    pgtype.Timestamptz
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
+	PromotionID        uuid.NullUUID
+	SubtotalLocalCents int32
+	PlatformFeeCents   int32
+	CourierFeeCents    int32
+	PricingSnapshot    []byte
 }
 
 type OrderItem struct {
@@ -242,6 +265,8 @@ type OrderItem struct {
 	LineTotalCents         int32
 	CreatedAt              time.Time
 	UpdatedAt              time.Time
+	UnitLocalTotalCents    int32
+	PlatformFeeBps         int32
 }
 
 type Organization struct {
@@ -285,6 +310,18 @@ type OrganizationInvitation struct {
 	RevokedAt      pgtype.Timestamptz
 }
 
+type OrganizationPricing struct {
+	OrganizationID      uuid.UUID
+	PlatformFeeBps      *int32
+	PromoPlatformFeeBps *int32
+	CourierFeeBps       *int32
+	DeliveryFeeCents    *int32
+	GatewayPlanCode     *string
+	EpaycoMerchantID    *string
+	UpdatedBy           uuid.UUID
+	UpdatedAt           time.Time
+}
+
 type OrganizationSetting struct {
 	OrganizationID uuid.UUID
 	LegalName      *string
@@ -313,17 +350,25 @@ type OrganizationSubscription struct {
 }
 
 type Payment struct {
-	ID             uuid.UUID
-	OrderID        uuid.UUID
-	OrganizationID uuid.UUID
-	Status         string
-	AmountCents    int32
-	Currency       string
-	Gateway        string
-	CheckoutUrl    *string
-	FailureReason  *string
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	ID                  uuid.UUID
+	OrderID             uuid.UUID
+	OrganizationID      uuid.UUID
+	Status              string
+	AmountCents         int32
+	Currency            string
+	Gateway             string
+	CheckoutUrl         *string
+	FailureReason       *string
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
+	Method              *string
+	BaseCents           *int32
+	TransactionFeeCents int32
+	GatewayPlanCode     *string
+	Breakdown           []byte
+	SessionID           *string
+	MethodUsed          *string
+	MethodMismatch      bool
 }
 
 type PaymentEvent struct {
@@ -341,19 +386,32 @@ type Permission struct {
 	Delegable   bool
 }
 
+type PricingSetting struct {
+	ID                  bool
+	PlatformFeeBps      int32
+	PromoPlatformFeeBps int32
+	CourierFeeBps       int32
+	DeliveryFeeCents    int32
+	GatewayPlanCode     string
+	SplitEnabled        bool
+	UpdatedBy           uuid.NullUUID
+	UpdatedAt           time.Time
+}
+
 type Product struct {
-	ID             uuid.UUID
-	OrganizationID uuid.UUID
-	CategoryID     uuid.NullUUID
-	Name           string
-	Description    *string
-	ImageUrl       *string
-	Position       int32
-	IsActive       bool
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
-	Ingredients    []string
-	Channels       []string
+	ID               uuid.UUID
+	OrganizationID   uuid.UUID
+	CategoryID       uuid.NullUUID
+	Name             string
+	Description      *string
+	ImageUrl         *string
+	Position         int32
+	IsActive         bool
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	Ingredients      []string
+	Channels         []string
+	PromoDiscountBps int32
 }
 
 type ProductModifierGroup struct {

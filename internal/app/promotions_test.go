@@ -145,7 +145,7 @@ func TestAplicarYQuitarUnCodigoDelCarrito(t *testing.T) {
 	want(t, h.do(http.MethodPost, promotionsURL(o, ""), newPromoReq("MIL", "fixed", 1000, nil), &admin), http.StatusCreated)
 
 	cart := aplicarCodigo(h, o, cliente, productID, variantID, 1, "diez") // sin distinguir mayúsculas
-	if cart["discount_cents"] != float64(300) || cart["total_cents"] != float64(2700) || cart["promotion_id"] == nil {
+	if cart["discount_cents"] != float64(330) || cart["total_cents"] != float64(2970) || cart["promotion_id"] == nil {
 		t.Fatalf("carrito con DIEZ = %v", cart)
 	}
 
@@ -153,7 +153,7 @@ func TestAplicarYQuitarUnCodigoDelCarrito(t *testing.T) {
 		rec := h.do(http.MethodPost, cartURL(o, "/promotion"), map[string]any{"code": "MIL"}, &cliente)
 		want(t, rec, http.StatusOK)
 		out := jsonMap(t, rec)
-		if out["discount_cents"] != float64(1000) || out["total_cents"] != float64(2000) {
+		if out["discount_cents"] != float64(1000) || out["total_cents"] != float64(2300) {
 			t.Fatalf("carrito con MIL = %v", out)
 		}
 	})
@@ -162,7 +162,7 @@ func TestAplicarYQuitarUnCodigoDelCarrito(t *testing.T) {
 		rec := h.do(http.MethodPatch, cartURL(o, "/items/"+cart["items"].([]any)[0].(map[string]any)["id"].(string)), map[string]any{"quantity": 2}, &cliente)
 		want(t, rec, http.StatusOK)
 		out := jsonMap(t, rec)
-		if out["discount_cents"] != float64(0) || out["promotion_id"] != nil || out["total_cents"] != float64(6000) {
+		if out["discount_cents"] != float64(0) || out["promotion_id"] != nil || out["total_cents"] != float64(6600) {
 			t.Fatalf("carrito tras editar líneas = %v", out)
 		}
 	})

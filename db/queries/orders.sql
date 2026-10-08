@@ -61,11 +61,12 @@ ORDER BY o.updated_at DESC, o.id;
 -- Recalcula subtotal_cents desde las líneas reales — nunca se confía en un total que mandó el
 -- cliente — y BORRA cualquier promoción aplicada: un cambio en el carrito invalida un descuento
 -- calculado contra el subtotal anterior (ver internal/promotions). La llaman las mutaciones del
--- carrito (agregar/cambiar/quitar una línea), nunca place().
+-- carrito (agregar/cambiar/quitar una línea), nunca place(). delivery_fee_cents viene de las
+-- tarifas vigentes de la organización (internal/pricing): el carrito ya muestra el domicilio.
 -- name: RecalcCartAmounts :one
 UPDATE orders
 SET subtotal_cents = @subtotal_cents, discount_cents = 0, promotion_id = NULL,
-    total_cents = @total_cents, updated_at = now()
+    delivery_fee_cents = @delivery_fee_cents, total_cents = @total_cents, updated_at = now()
 WHERE id = @id AND organization_id = @organization_id
 RETURNING *;
 
@@ -74,9 +75,15 @@ RETURNING *;
 -- promoción (eso ya la habría borrado), así que esto es sobre todo una confirmación. total_cents
 -- ya viene calculado desde Go (subtotal - descuento + envío, nunca negativo) — la aritmética de
 -- negocio vive ahí, no en SQL.
+-- Además congela lo que el pago necesita (docs/pagos.md §8): subtotal local (lo del restaurante),
+-- comisión de la plataforma, domicilio y la parte de él que se queda la plataforma, y las tarifas
+-- con que se calculó todo (pricing_snapshot).
 -- name: SetOrderAmounts :one
 UPDATE orders
-SET subtotal_cents = @subtotal_cents, total_cents = @total_cents, updated_at = now()
+SET subtotal_cents = @subtotal_cents, subtotal_local_cents = @subtotal_local_cents,
+    platform_fee_cents = @platform_fee_cents, delivery_fee_cents = @delivery_fee_cents,
+    courier_fee_cents = @courier_fee_cents, pricing_snapshot = @pricing_snapshot,
+    total_cents = @total_cents, updated_at = now()
 WHERE id = @id AND organization_id = @organization_id
 RETURNING *;
 
@@ -115,10 +122,12 @@ RETURNING *;
 -- name: InsertOrderItem :one
 INSERT INTO order_items (
     order_id, organization_id, product_variant_id, name_snapshot,
-    unit_price_cents_snapshot, modifiers_snapshot, unit_total_cents, quantity, line_total_cents
+    unit_price_cents_snapshot, modifiers_snapshot, unit_total_cents, quantity, line_total_cents,
+    unit_local_total_cents, platform_fee_bps
 ) VALUES (
     @order_id, @organization_id, @product_variant_id, @name_snapshot,
-    @unit_price_cents_snapshot, @modifiers_snapshot, @unit_total_cents, @quantity, @line_total_cents
+    @unit_price_cents_snapshot, @modifiers_snapshot, @unit_total_cents, @quantity, @line_total_cents,
+    @unit_local_total_cents, @platform_fee_bps
 )
 RETURNING *;
 
@@ -142,3 +151,7 @@ DELETE FROM order_items WHERE id = @id AND order_id = @order_id AND organization
 -- mandó por su cuenta.
 -- name: SumOrderItems :one
 SELECT COALESCE(sum(line_total_cents), 0)::bigint FROM order_items WHERE order_id = @order_id;
+
+-- La parte del restaurante en las líneas del pedido (precio local × cantidad).
+-- name: SumOrderItemsLocal :one
+SELECT COALESCE(sum(unit_local_total_cents::bigint * quantity), 0)::bigint FROM order_items WHERE order_id = @order_id;

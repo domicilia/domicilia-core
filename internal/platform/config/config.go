@@ -78,6 +78,8 @@ type Config struct {
 	EpaycoPrivateKey string `env:"CORE_EPAYCO_PRIVATE_KEY"`
 	EpaycoCustomerID string `env:"CORE_EPAYCO_CUSTOMER_ID"`
 	EpaycoTestMode   bool   `env:"CORE_EPAYCO_TEST_MODE" envDefault:"true"`
+	// API que crea las sesiones del checkout onpage (checkout-v2). Configurable para pruebas.
+	EpaycoApifyURL string `env:"CORE_EPAYCO_APIFY_URL" envDefault:"https://apify.epayco.co"`
 
 	// Fotos de producto en Azure Blob Storage (ver domicilia-infra/modules/storage). El VM sube
 	// con su identidad administrada (IMDS) — ver internal/platform/azblob — sin ninguna

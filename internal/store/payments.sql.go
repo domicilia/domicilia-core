@@ -12,7 +12,7 @@ import (
 )
 
 const getPayment = `-- name: GetPayment :one
-SELECT id, order_id, organization_id, status, amount_cents, currency, gateway, checkout_url, failure_reason, created_at, updated_at FROM payments WHERE id = $1 AND organization_id = $2
+SELECT id, order_id, organization_id, status, amount_cents, currency, gateway, checkout_url, failure_reason, created_at, updated_at, method, base_cents, transaction_fee_cents, gateway_plan_code, breakdown, session_id, method_used, method_mismatch FROM payments WHERE id = $1 AND organization_id = $2
 `
 
 type GetPaymentParams struct {
@@ -35,12 +35,20 @@ func (q *Queries) GetPayment(ctx context.Context, arg GetPaymentParams) (Payment
 		&i.FailureReason,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Method,
+		&i.BaseCents,
+		&i.TransactionFeeCents,
+		&i.GatewayPlanCode,
+		&i.Breakdown,
+		&i.SessionID,
+		&i.MethodUsed,
+		&i.MethodMismatch,
 	)
 	return i, err
 }
 
 const getPaymentByID = `-- name: GetPaymentByID :one
-SELECT id, order_id, organization_id, status, amount_cents, currency, gateway, checkout_url, failure_reason, created_at, updated_at FROM payments WHERE id = $1
+SELECT id, order_id, organization_id, status, amount_cents, currency, gateway, checkout_url, failure_reason, created_at, updated_at, method, base_cents, transaction_fee_cents, gateway_plan_code, breakdown, session_id, method_used, method_mismatch FROM payments WHERE id = $1
 `
 
 // Sin organization_id: la usa el webhook de la pasarela, que solo conoce el id que le mandamos
@@ -60,22 +68,37 @@ func (q *Queries) GetPaymentByID(ctx context.Context, id uuid.UUID) (Payment, er
 		&i.FailureReason,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Method,
+		&i.BaseCents,
+		&i.TransactionFeeCents,
+		&i.GatewayPlanCode,
+		&i.Breakdown,
+		&i.SessionID,
+		&i.MethodUsed,
+		&i.MethodMismatch,
 	)
 	return i, err
 }
 
 const insertPayment = `-- name: InsertPayment :one
-INSERT INTO payments (order_id, organization_id, amount_cents, currency, gateway)
-VALUES ($1, $2, $3, $4, $5)
-RETURNING id, order_id, organization_id, status, amount_cents, currency, gateway, checkout_url, failure_reason, created_at, updated_at
+INSERT INTO payments (order_id, organization_id, amount_cents, currency, gateway,
+    method, base_cents, transaction_fee_cents, gateway_plan_code, breakdown)
+VALUES ($1, $2, $3, $4, $5,
+    $6, $7, $8, $9, $10)
+RETURNING id, order_id, organization_id, status, amount_cents, currency, gateway, checkout_url, failure_reason, created_at, updated_at, method, base_cents, transaction_fee_cents, gateway_plan_code, breakdown, session_id, method_used, method_mismatch
 `
 
 type InsertPaymentParams struct {
-	OrderID        uuid.UUID
-	OrganizationID uuid.UUID
-	AmountCents    int32
-	Currency       string
-	Gateway        string
+	OrderID             uuid.UUID
+	OrganizationID      uuid.UUID
+	AmountCents         int32
+	Currency            string
+	Gateway             string
+	Method              *string
+	BaseCents           *int32
+	TransactionFeeCents int32
+	GatewayPlanCode     *string
+	Breakdown           []byte
 }
 
 func (q *Queries) InsertPayment(ctx context.Context, arg InsertPaymentParams) (Payment, error) {
@@ -85,6 +108,11 @@ func (q *Queries) InsertPayment(ctx context.Context, arg InsertPaymentParams) (P
 		arg.AmountCents,
 		arg.Currency,
 		arg.Gateway,
+		arg.Method,
+		arg.BaseCents,
+		arg.TransactionFeeCents,
+		arg.GatewayPlanCode,
+		arg.Breakdown,
 	)
 	var i Payment
 	err := row.Scan(
@@ -99,6 +127,14 @@ func (q *Queries) InsertPayment(ctx context.Context, arg InsertPaymentParams) (P
 		&i.FailureReason,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Method,
+		&i.BaseCents,
+		&i.TransactionFeeCents,
+		&i.GatewayPlanCode,
+		&i.Breakdown,
+		&i.SessionID,
+		&i.MethodUsed,
+		&i.MethodMismatch,
 	)
 	return i, err
 }
@@ -126,7 +162,7 @@ func (q *Queries) InsertPaymentEvent(ctx context.Context, arg InsertPaymentEvent
 }
 
 const listPaymentsByOrder = `-- name: ListPaymentsByOrder :many
-SELECT id, order_id, organization_id, status, amount_cents, currency, gateway, checkout_url, failure_reason, created_at, updated_at FROM payments WHERE order_id = $1 AND organization_id = $2 ORDER BY created_at DESC, id DESC
+SELECT id, order_id, organization_id, status, amount_cents, currency, gateway, checkout_url, failure_reason, created_at, updated_at, method, base_cents, transaction_fee_cents, gateway_plan_code, breakdown, session_id, method_used, method_mismatch FROM payments WHERE order_id = $1 AND organization_id = $2 ORDER BY created_at DESC, id DESC
 `
 
 type ListPaymentsByOrderParams struct {
@@ -157,6 +193,14 @@ func (q *Queries) ListPaymentsByOrder(ctx context.Context, arg ListPaymentsByOrd
 			&i.FailureReason,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.Method,
+			&i.BaseCents,
+			&i.TransactionFeeCents,
+			&i.GatewayPlanCode,
+			&i.Breakdown,
+			&i.SessionID,
+			&i.MethodUsed,
+			&i.MethodMismatch,
 		); err != nil {
 			return nil, err
 		}
@@ -171,7 +215,7 @@ func (q *Queries) ListPaymentsByOrder(ctx context.Context, arg ListPaymentsByOrd
 const setPaymentCheckoutURL = `-- name: SetPaymentCheckoutURL :one
 UPDATE payments SET checkout_url = $1, updated_at = now()
 WHERE id = $2
-RETURNING id, order_id, organization_id, status, amount_cents, currency, gateway, checkout_url, failure_reason, created_at, updated_at
+RETURNING id, order_id, organization_id, status, amount_cents, currency, gateway, checkout_url, failure_reason, created_at, updated_at, method, base_cents, transaction_fee_cents, gateway_plan_code, breakdown, session_id, method_used, method_mismatch
 `
 
 type SetPaymentCheckoutURLParams struct {
@@ -194,6 +238,94 @@ func (q *Queries) SetPaymentCheckoutURL(ctx context.Context, arg SetPaymentCheck
 		&i.FailureReason,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Method,
+		&i.BaseCents,
+		&i.TransactionFeeCents,
+		&i.GatewayPlanCode,
+		&i.Breakdown,
+		&i.SessionID,
+		&i.MethodUsed,
+		&i.MethodMismatch,
+	)
+	return i, err
+}
+
+const setPaymentMethodUsed = `-- name: SetPaymentMethodUsed :one
+UPDATE payments SET method_used = $1, method_mismatch = $2, updated_at = now()
+WHERE id = $3
+RETURNING id, order_id, organization_id, status, amount_cents, currency, gateway, checkout_url, failure_reason, created_at, updated_at, method, base_cents, transaction_fee_cents, gateway_plan_code, breakdown, session_id, method_used, method_mismatch
+`
+
+type SetPaymentMethodUsedParams struct {
+	MethodUsed     *string
+	MethodMismatch bool
+	ID             uuid.UUID
+}
+
+// Lo que la pasarela dice que se usó para pagar (x_franchise en ePayco) y si coincide con lo que
+// el cliente declaró. Se registra aunque el pago ya estuviera resuelto: es información de
+// conciliación, no cambia el estado.
+func (q *Queries) SetPaymentMethodUsed(ctx context.Context, arg SetPaymentMethodUsedParams) (Payment, error) {
+	row := q.db.QueryRow(ctx, setPaymentMethodUsed, arg.MethodUsed, arg.MethodMismatch, arg.ID)
+	var i Payment
+	err := row.Scan(
+		&i.ID,
+		&i.OrderID,
+		&i.OrganizationID,
+		&i.Status,
+		&i.AmountCents,
+		&i.Currency,
+		&i.Gateway,
+		&i.CheckoutUrl,
+		&i.FailureReason,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Method,
+		&i.BaseCents,
+		&i.TransactionFeeCents,
+		&i.GatewayPlanCode,
+		&i.Breakdown,
+		&i.SessionID,
+		&i.MethodUsed,
+		&i.MethodMismatch,
+	)
+	return i, err
+}
+
+const setPaymentSession = `-- name: SetPaymentSession :one
+UPDATE payments SET session_id = $1, updated_at = now()
+WHERE id = $2
+RETURNING id, order_id, organization_id, status, amount_cents, currency, gateway, checkout_url, failure_reason, created_at, updated_at, method, base_cents, transaction_fee_cents, gateway_plan_code, breakdown, session_id, method_used, method_mismatch
+`
+
+type SetPaymentSessionParams struct {
+	SessionID *string
+	ID        uuid.UUID
+}
+
+func (q *Queries) SetPaymentSession(ctx context.Context, arg SetPaymentSessionParams) (Payment, error) {
+	row := q.db.QueryRow(ctx, setPaymentSession, arg.SessionID, arg.ID)
+	var i Payment
+	err := row.Scan(
+		&i.ID,
+		&i.OrderID,
+		&i.OrganizationID,
+		&i.Status,
+		&i.AmountCents,
+		&i.Currency,
+		&i.Gateway,
+		&i.CheckoutUrl,
+		&i.FailureReason,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Method,
+		&i.BaseCents,
+		&i.TransactionFeeCents,
+		&i.GatewayPlanCode,
+		&i.Breakdown,
+		&i.SessionID,
+		&i.MethodUsed,
+		&i.MethodMismatch,
 	)
 	return i, err
 }
@@ -202,7 +334,7 @@ const settlePayment = `-- name: SettlePayment :one
 UPDATE payments
 SET status = $1, failure_reason = $2, updated_at = now()
 WHERE id = $3 AND status = 'pending'
-RETURNING id, order_id, organization_id, status, amount_cents, currency, gateway, checkout_url, failure_reason, created_at, updated_at
+RETURNING id, order_id, organization_id, status, amount_cents, currency, gateway, checkout_url, failure_reason, created_at, updated_at, method, base_cents, transaction_fee_cents, gateway_plan_code, breakdown, session_id, method_used, method_mismatch
 `
 
 type SettlePaymentParams struct {
@@ -229,6 +361,14 @@ func (q *Queries) SettlePayment(ctx context.Context, arg SettlePaymentParams) (P
 		&i.FailureReason,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Method,
+		&i.BaseCents,
+		&i.TransactionFeeCents,
+		&i.GatewayPlanCode,
+		&i.Breakdown,
+		&i.SessionID,
+		&i.MethodUsed,
+		&i.MethodMismatch,
 	)
 	return i, err
 }

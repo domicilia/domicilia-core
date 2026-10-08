@@ -125,7 +125,7 @@ func toProductBase(p store.Product) Product {
 		ID: p.ID, OrganizationID: p.OrganizationID, CategoryID: uuidPtr(p.CategoryID),
 		Name: p.Name, Description: p.Description, ImageURL: p.ImageUrl,
 		Position: int(p.Position), IsActive: p.IsActive, CreatedAt: p.CreatedAt, UpdatedAt: p.UpdatedAt,
-		Ingredients: ingredients, Channels: channels,
+		Ingredients: ingredients, Channels: channels, PromoDiscountBps: p.PromoDiscountBps,
 		// Nunca nil: la mayoría de los productos no tiene grupos de modificadores, y un slice
 		// nil sale como `null` en JSON, no `[]` — el contrato OpenAPI exige array, no null.
 		Variants:         []Variant{},
@@ -246,7 +246,7 @@ func (r *pgRepository) InsertProduct(ctx context.Context, n NewProduct) (Product
 		row, err := q.InsertProduct(ctx, store.InsertProductParams{
 			OrganizationID: n.OrganizationID, CategoryID: nullUUID(n.CategoryID), Name: n.Name,
 			Description: n.Description, ImageUrl: n.ImageURL, Position: int32(n.Position), //nolint:gosec
-			Ingredients: ingredients, Channels: channels,
+			Ingredients: ingredients, Channels: channels, PromoDiscountBps: n.PromoDiscountBps,
 		})
 		if db.IsForeignKeyViolation(err) {
 			return ErrCategoryNotFound
@@ -325,6 +325,7 @@ func (r *pgRepository) UpdateProduct(ctx context.Context, orgID, id uuid.UUID, p
 			SetImage: p.SetImage, ImageUrl: p.ImageURL, Position: position, IsActive: p.IsActive,
 			SetIngredients: p.Ingredients != nil, Ingredients: ingredients,
 			SetChannels: p.Channels != nil, Channels: channels,
+			PromoDiscountBps: p.PromoDiscountBps,
 		})
 		if db.IsNoRows(err) {
 			return ErrNotFound
@@ -576,7 +577,7 @@ func toFeedProduct(r store.ListPublicProductsRow) FeedProduct {
 		OrganizationSlug: r.OrganizationSlug, OrganizationLogoURL: r.OrganizationLogoUrl,
 		CategoryID: uuidPtr(r.CategoryID), CategoryName: r.CategoryName,
 		Name: r.Name, Description: r.Description, ImageURL: r.ImageUrl,
-		MinPriceCents: r.MinPriceCents,
+		MinPriceCents: r.MinPriceCents, PromoDiscountBps: r.PromoDiscountBps,
 	}
 }
 

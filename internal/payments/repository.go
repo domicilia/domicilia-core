@@ -17,20 +17,64 @@ type pgRepository struct{ q *store.Queries }
 func NewRepository(pool *pgxpool.Pool) Repository { return &pgRepository{q: store.New(pool)} }
 
 func toPayment(p store.Payment) Payment {
+	breakdown := p.Breakdown
+	if len(breakdown) == 0 {
+		breakdown = []byte("{}")
+	}
 	return Payment{
 		ID: p.ID, OrderID: p.OrderID, OrganizationID: p.OrganizationID, Status: Status(p.Status),
 		AmountCents: p.AmountCents, Currency: p.Currency, Gateway: p.Gateway,
 		CheckoutURL: p.CheckoutUrl, FailureReason: p.FailureReason,
+		Method: p.Method, BaseCents: p.BaseCents, TransactionFeeCents: p.TransactionFeeCents,
+		GatewayPlanCode: p.GatewayPlanCode, Breakdown: breakdown, SessionID: p.SessionID,
+		MethodUsed: p.MethodUsed, MethodMismatch: p.MethodMismatch,
 		CreatedAt: p.CreatedAt, UpdatedAt: p.UpdatedAt,
 	}
 }
 
-func (r *pgRepository) Insert(ctx context.Context, orderID, orgID uuid.UUID, amountCents int32, currency, gateway string) (Payment, error) {
-	p, err := r.q.InsertPayment(ctx, store.InsertPaymentParams{
-		OrderID: orderID, OrganizationID: orgID, AmountCents: amountCents, Currency: currency, Gateway: gateway,
-	})
+func (r *pgRepository) Insert(ctx context.Context, n NewPayment) (Payment, error) {
+	params := store.InsertPaymentParams{
+		OrderID: n.OrderID, OrganizationID: n.OrganizationID, AmountCents: n.AmountCents, Currency: n.Currency,
+		Gateway: n.Gateway, TransactionFeeCents: n.TransactionFeeCents, Breakdown: n.Breakdown,
+	}
+	if params.Breakdown == nil {
+		params.Breakdown = []byte("{}")
+	}
+	if n.Method != "" {
+		m := string(n.Method)
+		params.Method = &m
+		base := n.BaseCents
+		params.BaseCents = &base
+	}
+	if n.GatewayPlanCode != "" {
+		code := n.GatewayPlanCode
+		params.GatewayPlanCode = &code
+	}
+	p, err := r.q.InsertPayment(ctx, params)
 	if err != nil {
 		return Payment{}, fmt.Errorf("payments: crear: %w", err)
+	}
+	return toPayment(p), nil
+}
+
+func (r *pgRepository) SetSession(ctx context.Context, id uuid.UUID, sessionID string) (Payment, error) {
+	p, err := r.q.SetPaymentSession(ctx, store.SetPaymentSessionParams{ID: id, SessionID: &sessionID})
+	if db.IsNoRows(err) {
+		return Payment{}, ErrNotFound
+	}
+	if err != nil {
+		return Payment{}, fmt.Errorf("payments: guardar sesión: %w", err)
+	}
+	return toPayment(p), nil
+}
+
+func (r *pgRepository) SetMethodUsed(ctx context.Context, id uuid.UUID, methodUsed string, mismatch bool) (Payment, error) {
+	p, err := r.q.SetPaymentMethodUsed(ctx, store.SetPaymentMethodUsedParams{ID: id, MethodUsed: &methodUsed, MethodMismatch: mismatch})
+	if db.IsNoRows(err) {
+		return Payment{}, ErrNotFound
+	}
+	if err != nil {
+		return Payment{}, fmt.Errorf("payments: guardar medio usado: %w", err)
 	}
 	return toPayment(p), nil
 }

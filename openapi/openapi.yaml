@@ -705,6 +705,32 @@ paths:
               schema: { $ref: '#/components/schemas/Order' }
         default: { $ref: '#/components/responses/Problem' }
 
+  /v1/organizations/{org_id}/orders/{order_id}/payment-quote:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/OrderID'
+    get:
+      tags: [Pagos]
+      operationId: quoteOrderPayment
+      summary: Desglose del pago con un medio de pago (antes de pagar)
+      description: |
+        Lo que el cliente ve y acepta ANTES de pagar (docs/pagos.md §8): subtotal, descuento, domicilio, costo de
+        transacción del medio elegido y total exacto a cobrar. Cobrar un recargo por el medio de pago solo es legal si
+        se informa antes y el cliente lo acepta: por eso `pay` exige este mismo total. Mismas reglas de acceso y estado
+        que `pay` (pedido propio, `placed`).
+      parameters:
+        - name: method
+          in: query
+          required: true
+          schema: { $ref: '#/components/schemas/PaymentMethod' }
+      responses:
+        '200':
+          description: Desglose
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaymentQuote' }
+        default: { $ref: '#/components/responses/Problem' }
+
   /v1/organizations/{org_id}/orders/{order_id}/pay:
     parameters:
       - $ref: '#/components/parameters/OrgID'
@@ -715,14 +741,26 @@ paths:
       summary: Inicia el cobro de un pedido propio
       description: |
         Requiere que el pedido sea propio (mismo criterio que Mis pedidos, no un permiso de organización) y que
-        esté `placed` (recién confirmado, o de vuelta ahí por `retry-payment`) — si no, 409. Responde 503 si el
-        servidor no tiene una pasarela de pago configurada.
+        esté `placed` (recién confirmado, o de vuelta ahí por `retry-payment`) — si no, 409. Exige el medio de pago y
+        el total que el cliente aceptó en `payment-quote`: si las tarifas cambiaron entre medio, 409. Responde 503 si el
+        servidor no tiene una pasarela de pago configurada. Con ePayco devuelve una sesión del checkout onpage
+        (`type: onpage`); si crearla falla, el cobro sigue con la URL de redirección (`type: redirect`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [method, expected_total_cents]
+              properties:
+                method: { $ref: '#/components/schemas/PaymentMethod' }
+                expected_total_cents: { type: integer, description: 'El total_cents de payment-quote que el cliente aceptó.' }
       responses:
         '201':
-          description: Cobro iniciado, con la URL a la que mandar al cliente a pagar
+          description: Cobro iniciado
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Payment' }
+              schema: { $ref: '#/components/schemas/Checkout' }
         default: { $ref: '#/components/responses/Problem' }
 
   /v1/organizations/{org_id}/orders/{order_id}/payments:
@@ -1598,8 +1636,58 @@ components:
         gateway: { type: string, enum: [epayco] }
         checkout_url: { type: string, nullable: true, description: 'Adonde se mandó al cliente a pagar. Null hasta que se arma (no debería tardar).' }
         failure_reason: { type: string, nullable: true }
+        method: { allOf: [{ $ref: '#/components/schemas/PaymentMethod' }], nullable: true, description: 'Medio que declaró el cliente.' }
+        base_cents: { type: integer, nullable: true, description: 'Lo que debe quedar después de la tarifa de la pasarela.' }
+        transaction_fee_cents: { type: integer, description: 'Costo de transacción que el cliente aceptó.' }
+        gateway_plan_code: { type: string, nullable: true }
+        breakdown: { type: object, additionalProperties: true, description: 'Copia del desglose (PaymentQuote) con que se creó.' }
+        session_id: { type: string, nullable: true, description: 'Sesión del checkout onpage de ePayco.' }
+        method_used: { type: string, nullable: true, description: 'Lo que la pasarela dice que se usó (x_franchise).' }
+        method_mismatch: { type: boolean, description: 'El medio usado no coincide con el declarado (conciliación).' }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+
+    PaymentMethod:
+      type: string
+      enum: [card, card_international, pse, wallet]
+      description: 'Tarjeta nacional, tarjeta internacional, PSE, Nequi/Daviplata.'
+
+    PaymentSplit:
+      type: object
+      properties:
+        organization_cents: { type: integer }
+        platform_cents: { type: integer }
+        platform_fee_cents: { type: integer }
+        courier_cents: { type: integer }
+        courier_fee_cents: { type: integer }
+
+    PaymentQuote:
+      type: object
+      required: [method, subtotal_cents, discount_cents, delivery_fee_cents, base_cents, transaction_fee_cents, total_cents]
+      properties:
+        method: { $ref: '#/components/schemas/PaymentMethod' }
+        method_label: { type: string }
+        plan_code: { type: string }
+        plan_name: { type: string }
+        subtotal_cents: { type: integer }
+        discount_cents: { type: integer }
+        delivery_fee_cents: { type: integer }
+        base_cents: { type: integer }
+        transaction_fee_cents: { type: integer }
+        total_cents: { type: integer }
+        gateway_fee_cents: { type: integer }
+        gateway_fee_vat_cents: { type: integer }
+        split: { $ref: '#/components/schemas/PaymentSplit' }
+
+    Checkout:
+      type: object
+      required: [payment, type, test_mode, quote]
+      properties:
+        payment: { $ref: '#/components/schemas/Payment' }
+        type: { type: string, enum: [onpage, redirect] }
+        session_id: { type: string, description: 'Solo con type onpage: se abre con checkout-v2.js de ePayco.' }
+        test_mode: { type: boolean }
+        quote: { $ref: '#/components/schemas/PaymentQuote' }
 
     AddCartItemRequest:
       type: object

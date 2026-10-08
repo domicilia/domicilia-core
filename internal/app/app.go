@@ -26,6 +26,7 @@ import (
 	"github.com/domicilia/domicilia-core/internal/platform/config"
 	"github.com/domicilia/domicilia-core/internal/platform/httpserver"
 	"github.com/domicilia/domicilia-core/internal/platform/mail"
+	"github.com/domicilia/domicilia-core/internal/pricing"
 	"github.com/domicilia/domicilia-core/internal/promotions"
 	"github.com/domicilia/domicilia-core/internal/roles"
 	"github.com/domicilia/domicilia-core/internal/saas"
@@ -120,8 +121,11 @@ func New(d Deps) *echo.Echo {
 	if mediaUploader == nil && cfg.MediaStorageAccount != "" {
 		mediaUploader = azblob.New(cfg.MediaStorageAccount, cfg.MediaContainer)
 	}
-	catalogSvc := catalog.NewService(catalogRepo, catalogGate, mediaUploader)
-	ordersSvc := orders.NewService(orders.NewRepository(d.Pool), catalogRepo, catalogGate)
+	// Comisiones y tarifas (docs/pagos.md): catálogo, pedidos y pagos calculan con el MISMO
+	// algoritmo (internal/pricing), así un precio no puede salir distinto en dos pantallas.
+	pricingSvc := pricing.NewService(d.Pool, catalogGate)
+	catalogSvc := catalog.NewService(catalogRepo, catalogGate, mediaUploader, pricingSvc)
+	ordersSvc := orders.NewService(orders.NewRepository(d.Pool), catalogRepo, catalogGate, pricingSvc)
 	ingest := whatsapp.NewIngest(d.Pool, wa.inboxes, whatsapp.IngestConfig{
 		AppSecret: cfg.WhatsAppAppSecret, VerifyToken: cfg.WhatsAppVerifyToken,
 	}, d.Log, d.Now)
@@ -135,10 +139,10 @@ func New(d Deps) *echo.Echo {
 	if cfg.EpaycoPublicKey != "" {
 		gateway = epayco.New(epayco.Config{
 			PublicKey: cfg.EpaycoPublicKey, PrivateKey: cfg.EpaycoPrivateKey,
-			CustomerID: cfg.EpaycoCustomerID, TestMode: cfg.EpaycoTestMode,
+			CustomerID: cfg.EpaycoCustomerID, TestMode: cfg.EpaycoTestMode, ApifyURL: cfg.EpaycoApifyURL,
 		})
 	}
-	paymentsSvc := payments.NewService(payments.NewRepository(d.Pool), ordersSvc, catalogGate, gateway, cfg.PublicURL, cfg.AppURL)
+	paymentsSvc := payments.NewService(payments.NewRepository(d.Pool), ordersSvc, catalogGate, pricingSvc, gateway, cfg.PublicURL, cfg.AppURL)
 	// El webhook lo llama la pasarela, no un usuario: cuelga de la raíz y se autentica con su
 	// propia firma, igual que WhatsApp.
 	payments.NewWebhookHandler(paymentsSvc).Register(e)
@@ -170,6 +174,7 @@ func New(d Deps) *echo.Echo {
 	orders.NewHandler(ordersSvc).Register(business)
 	payments.NewHandler(paymentsSvc).Register(business)
 	promotions.NewHandler(promotionsSvc).Register(business)
+	pricing.NewHandler(pricingSvc).Register(business)
 
 	return e
 }

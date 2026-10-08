@@ -14,20 +14,28 @@ import (
 	"github.com/domicilia/domicilia-core/internal/identity"
 	"github.com/domicilia/domicilia-core/internal/platform/apperr"
 	"github.com/domicilia/domicilia-core/internal/platform/httpserver"
+	"github.com/domicilia/domicilia-core/internal/pricing"
 	"github.com/domicilia/domicilia-core/internal/tenant"
 )
 
+// Pricer resuelve las tarifas vigentes de una organización (internal/pricing). Las lecturas
+// públicas del catálogo devuelven el precio PUBLICADO (local + comisión), nunca el local.
+type Pricer interface {
+	RatesFor(ctx context.Context, orgID uuid.UUID) (pricing.Rates, error)
+}
+
 // Service reúne las reglas del catálogo.
 type Service struct {
-	repo  Repository
-	gate  *tenant.Gate
-	media MediaUploader
+	repo   Repository
+	gate   *tenant.Gate
+	media  MediaUploader
+	pricer Pricer
 }
 
 // NewService crea el servicio. media nil es válido: significa "sin almacenamiento de fotos
 // configurado" — ver el comentario de MediaUploader.
-func NewService(repo Repository, gate *tenant.Gate, media MediaUploader) *Service {
-	return &Service{repo: repo, gate: gate, media: media}
+func NewService(repo Repository, gate *tenant.Gate, media MediaUploader, pricer Pricer) *Service {
+	return &Service{repo: repo, gate: gate, media: media, pricer: pricer}
 }
 
 // ---------------------------------------------------------------------------
@@ -113,6 +121,7 @@ type CreateProductInput struct {
 	ModifierGroupIDs []uuid.UUID
 	Ingredients      []string
 	Channels         []string
+	PromoDiscountBps int32
 }
 
 // CreateProduct crea un producto con sus variantes (al menos una: ahí vive el precio) y, si
@@ -146,10 +155,13 @@ func (s *Service) CreateProduct(ctx context.Context, actor identity.Principal, o
 	if err != nil {
 		return Product{}, err
 	}
+	if err := validatePromoDiscount(in.PromoDiscountBps); err != nil {
+		return Product{}, err
+	}
 	p, err := s.repo.InsertProduct(ctx, NewProduct{
 		OrganizationID: orgID, CategoryID: in.CategoryID, Name: name, Description: desc,
 		ImageURL: in.ImageURL, Position: in.Position, Variants: variants, ModifierGroupIDs: groupIDs,
-		Ingredients: ingredients, Channels: channels,
+		Ingredients: ingredients, Channels: channels, PromoDiscountBps: in.PromoDiscountBps,
 	})
 	if errors.Is(err, ErrCategoryNotFound) {
 		return Product{}, apperr.Invalid("category_id no existe")
@@ -200,6 +212,8 @@ type UpdateProductInput struct {
 	// interruptor real de publicar/despublicar — ver el comentario de ProductPatch.
 	Ingredients *[]string
 	Channels    *[]string
+	// PromoDiscountBps nil no toca; 0 quita la promoción.
+	PromoDiscountBps *int32
 }
 
 // UpdateProduct cambia un producto.
@@ -209,7 +223,7 @@ func (s *Service) UpdateProduct(ctx context.Context, actor identity.Principal, o
 	}
 	if !in.CategoryID.Set && in.Name == nil && !in.Description.Set && !in.ImageURL.Set &&
 		in.Position == nil && in.IsActive == nil && in.Variants == nil && in.ModifierGroupIDs == nil &&
-		in.Ingredients == nil && in.Channels == nil {
+		in.Ingredients == nil && in.Channels == nil && in.PromoDiscountBps == nil {
 		return Product{}, apperr.Invalid("envía al menos un campo para actualizar")
 	}
 	p := ProductPatch{
@@ -258,6 +272,12 @@ func (s *Service) UpdateProduct(ctx context.Context, actor identity.Principal, o
 			return Product{}, err
 		}
 		p.Channels = &channels
+	}
+	if in.PromoDiscountBps != nil {
+		if err := validatePromoDiscount(*in.PromoDiscountBps); err != nil {
+			return Product{}, err
+		}
+		p.PromoDiscountBps = in.PromoDiscountBps
 	}
 	out, err := s.repo.UpdateProduct(ctx, orgID, id, p)
 	switch {
@@ -450,7 +470,43 @@ func (s *Service) UpdateModifierGroup(ctx context.Context, actor identity.Princi
 // PublicFeed lista productos de organizaciones activas, con al menos una variante activa cada
 // uno. Sin filtro.OrganizationID, cruza todas las organizaciones a propósito (el feed mezclado).
 func (s *Service) PublicFeed(ctx context.Context, filter PublicFeedFilter, limit, offset int) ([]FeedProduct, int64, error) {
-	return s.repo.ListPublicProducts(ctx, filter, limit, offset)
+	items, total, err := s.repo.ListPublicProducts(ctx, filter, limit, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	// El feed cruza organizaciones: tarifas por organización, resueltas una sola vez cada una.
+	rates := make(map[uuid.UUID]pricing.Rates)
+	for i := range items {
+		r, ok := rates[items[i].OrganizationID]
+		if !ok {
+			if r, err = s.pricer.RatesFor(ctx, items[i].OrganizationID); err != nil {
+				return nil, 0, err
+			}
+			rates[items[i].OrganizationID] = r
+		}
+		local := int64(items[i].MinPriceCents)
+		items[i].MinPriceCents = int32(r.PriceUnit(local, nil, items[i].PromoDiscountBps).TotalCents) //nolint:gosec // acotado por maxPriceCents
+		if items[i].PromoDiscountBps > 0 {
+			items[i].RegularMinPriceCents = int32(r.PriceUnit(local, nil, 0).TotalCents) //nolint:gosec
+		} else {
+			items[i].RegularMinPriceCents = items[i].MinPriceCents
+		}
+	}
+	return items, total, nil
+}
+
+// publish reescribe en el producto los precios locales por los publicados (variantes y opciones
+// de modificadores). Lo usan solo las lecturas públicas.
+func publish(r pricing.Rates, d *ProductDetail) {
+	for i := range d.Variants {
+		d.Variants[i].PriceCents = int32(r.PriceUnit(int64(d.Variants[i].PriceCents), nil, d.PromoDiscountBps).TotalCents) //nolint:gosec
+	}
+	for gi := range d.ModifierGroups {
+		opts := d.ModifierGroups[gi].Options
+		for oi := range opts {
+			opts[oi].PriceDeltaCents = int32(r.PriceUnit(int64(opts[oi].PriceDeltaCents), nil, d.PromoDiscountBps).TotalCents) //nolint:gosec
+		}
+	}
 }
 
 // PublicGetProductDetail devuelve un producto con sus variantes y grupos de modificadores
@@ -472,5 +528,11 @@ func (s *Service) PublicGetProductDetail(ctx context.Context, orgID, id uuid.UUI
 	if err != nil {
 		return ProductDetail{}, err
 	}
-	return ProductDetail{Product: p, ModifierGroups: groups}, nil
+	r, err := s.pricer.RatesFor(ctx, orgID)
+	if err != nil {
+		return ProductDetail{}, err
+	}
+	out := ProductDetail{Product: p, ModifierGroups: groups}
+	publish(r, &out)
+	return out, nil
 }

@@ -1,6 +1,8 @@
 -- name: InsertPayment :one
-INSERT INTO payments (order_id, organization_id, amount_cents, currency, gateway)
-VALUES (@order_id, @organization_id, @amount_cents, @currency, @gateway)
+INSERT INTO payments (order_id, organization_id, amount_cents, currency, gateway,
+    method, base_cents, transaction_fee_cents, gateway_plan_code, breakdown)
+VALUES (@order_id, @organization_id, @amount_cents, @currency, @gateway,
+    sqlc.narg('method'), sqlc.narg('base_cents'), @transaction_fee_cents, sqlc.narg('gateway_plan_code'), @breakdown)
 RETURNING *;
 
 -- name: GetPayment :one
@@ -36,3 +38,16 @@ RETURNING *;
 INSERT INTO payment_events (source, event_key, payload)
 VALUES (@source, @event_key, @payload)
 ON CONFLICT (source, event_key) DO NOTHING;
+
+-- name: SetPaymentSession :one
+UPDATE payments SET session_id = @session_id, updated_at = now()
+WHERE id = @id
+RETURNING *;
+
+-- Lo que la pasarela dice que se usó para pagar (x_franchise en ePayco) y si coincide con lo que
+-- el cliente declaró. Se registra aunque el pago ya estuviera resuelto: es información de
+-- conciliación, no cambia el estado.
+-- name: SetPaymentMethodUsed :one
+UPDATE payments SET method_used = @method_used, method_mismatch = @method_mismatch, updated_at = now()
+WHERE id = @id
+RETURNING *;

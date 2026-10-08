@@ -49,6 +49,11 @@ const (
 	InboxRenamed                Action = "inbox.renamed"
 	InboxCredentialsRotated     Action = "inbox.credentials_rotated" //nolint:gosec // es el nombre de una acción de auditoría, no una credencial
 	InboxArchived               Action = "inbox.archived"
+
+	// Comisiones y tarifas (internal/pricing, docs/pagos.md).
+	PricingSettingsChanged     Action = "pricing.settings_changed"
+	GatewayFeePlanChanged      Action = "pricing.gateway_plan_changed"
+	OrganizationPricingChanged Action = "organization.pricing_changed"
 )
 
 // Entry es un cambio a registrar. Los ids en uuid.Nil se guardan como NULL.

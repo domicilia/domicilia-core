@@ -150,7 +150,19 @@ func Reset(ctx context.Context, pool *pgxpool.Pool) error {
 		DELETE FROM users;
 		DELETE FROM roles WHERE NOT is_system;
 		DELETE FROM organizations;
-		DELETE FROM auth.users;`)
+		DELETE FROM auth.users;
+		-- Tarifas (00010_pricing): de vuelta a lo que siembra la migración, por si una prueba las
+		-- cambió. organization_pricing ya se fue en cascada con organizations.
+		UPDATE pricing_settings SET platform_fee_bps = 1000, promo_platform_fee_bps = 500, courier_fee_bps = 0,
+			delivery_fee_cents = 0, gateway_plan_code = 'epayco_davivienda', split_enabled = false, updated_by = NULL;
+		UPDATE gateway_fee_plans SET card_percent_bps = 264, card_fixed_cents = 69000, international_extra_bps = 80,
+			wallet_percent_bps = 264, wallet_fixed_cents = 69000, pse_percent_bps = 264, pse_fixed_cents = 69000,
+			pse_small_threshold_cents = 6000000, pse_small_fixed_cents = 220000, vat_bps = 1900, updated_by = NULL
+			WHERE code = 'epayco_davivienda';
+		UPDATE gateway_fee_plans SET card_percent_bps = 329, card_fixed_cents = 70000, international_extra_bps = 80,
+			wallet_percent_bps = 329, wallet_fixed_cents = 70000, pse_percent_bps = 329, pse_fixed_cents = 70000,
+			pse_small_threshold_cents = 6000000, pse_small_fixed_cents = 220000, vat_bps = 1900, updated_by = NULL
+			WHERE code = 'epayco_otros_bancos';`)
 	if err != nil {
 		return fmt.Errorf("pgtest: vaciar tablas: %w", err)
 	}

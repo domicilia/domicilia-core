@@ -10,8 +10,14 @@ import (
 	"github.com/domicilia/domicilia-core/internal/access"
 	"github.com/domicilia/domicilia-core/internal/identity"
 	"github.com/domicilia/domicilia-core/internal/platform/apperr"
+	"github.com/domicilia/domicilia-core/internal/pricing"
 	"github.com/domicilia/domicilia-core/internal/tenant"
 )
+
+// Pricer resuelve las tarifas vigentes de una organización (internal/pricing).
+type Pricer interface {
+	RatesFor(ctx context.Context, orgID uuid.UUID) (pricing.Rates, error)
+}
 
 // Service reúne las reglas de los pedidos. gate exige permiso (lado del negocio);
 // gate.OpenForCustomer solo exige que la organización exista y esté activa (lado del cliente) —
@@ -20,11 +26,12 @@ type Service struct {
 	repo    Repository
 	catalog CatalogReader
 	gate    *tenant.Gate
+	pricer  Pricer
 }
 
 // NewService crea el servicio.
-func NewService(repo Repository, catalogReader CatalogReader, gate *tenant.Gate) *Service {
-	return &Service{repo: repo, catalog: catalogReader, gate: gate}
+func NewService(repo Repository, catalogReader CatalogReader, gate *tenant.Gate, pricer Pricer) *Service {
+	return &Service{repo: repo, catalog: catalogReader, gate: gate, pricer: pricer}
 }
 
 // ---------------------------------------------------------------------------
@@ -48,7 +55,11 @@ func (s *Service) AddItem(ctx context.Context, actor identity.Principal, orgID u
 	if len(in.OptionIDs) > maxOptionsPerLine {
 		return Order{}, apperr.Invalid("una línea admite hasta 50 opciones de modificador")
 	}
-	item, err := resolveLine(ctx, s.catalog, orgID, in)
+	rates, err := s.pricer.RatesFor(ctx, orgID)
+	if err != nil {
+		return Order{}, err
+	}
+	item, err := resolveLine(ctx, s.catalog, rates, orgID, in)
 	if err != nil {
 		return Order{}, err
 	}
@@ -59,7 +70,7 @@ func (s *Service) AddItem(ctx context.Context, actor identity.Principal, orgID u
 	if len(cart.Items) >= maxItemsPerOrder {
 		return Order{}, apperr.Invalid("el carrito admite hasta " + strconv.Itoa(maxItemsPerOrder) + " líneas")
 	}
-	return s.repo.AddItem(ctx, orgID, cart.ID, item)
+	return s.repo.AddItem(ctx, orgID, cart.ID, item, rates.DeliveryFeeCents)
 }
 
 // UpdateItemQuantity cambia la cantidad de una línea del carrito propio.
@@ -74,7 +85,11 @@ func (s *Service) UpdateItemQuantity(ctx context.Context, actor identity.Princip
 	if err != nil {
 		return Order{}, err
 	}
-	out, err := s.repo.UpdateItemQuantity(ctx, orgID, cart.ID, itemID, quantity)
+	rates, err := s.pricer.RatesFor(ctx, orgID)
+	if err != nil {
+		return Order{}, err
+	}
+	out, err := s.repo.UpdateItemQuantity(ctx, orgID, cart.ID, itemID, quantity, rates.DeliveryFeeCents)
 	if errors.Is(err, ErrItemNotFound) {
 		return Order{}, apperr.NotFound("línea no encontrada")
 	}
@@ -90,7 +105,11 @@ func (s *Service) RemoveItem(ctx context.Context, actor identity.Principal, orgI
 	if err != nil {
 		return Order{}, err
 	}
-	out, err := s.repo.RemoveItem(ctx, orgID, cart.ID, itemID)
+	rates, err := s.pricer.RatesFor(ctx, orgID)
+	if err != nil {
+		return Order{}, err
+	}
+	out, err := s.repo.RemoveItem(ctx, orgID, cart.ID, itemID, rates.DeliveryFeeCents)
 	if errors.Is(err, ErrItemNotFound) {
 		return Order{}, apperr.NotFound("línea no encontrada")
 	}
@@ -110,7 +129,11 @@ func (s *Service) Place(ctx context.Context, actor identity.Principal, orgID uui
 	if len(cart.Items) == 0 {
 		return Order{}, apperr.Invalid("el carrito está vacío")
 	}
-	return s.repo.Transition(ctx, orgID, cart.ID, OpPlace, true)
+	rates, err := s.pricer.RatesFor(ctx, orgID)
+	if err != nil {
+		return Order{}, err
+	}
+	return s.repo.Transition(ctx, orgID, cart.ID, OpPlace, &rates)
 }
 
 // MyOrders es "mis pedidos": cruza organizaciones a propósito, nunca incluye el carrito.
@@ -140,7 +163,7 @@ func (s *Service) CancelMyOrder(ctx context.Context, actor identity.Principal, i
 	if err != nil {
 		return Order{}, err
 	}
-	out, err := s.repo.Transition(ctx, o.OrganizationID, o.ID, OpCancel, false)
+	out, err := s.repo.Transition(ctx, o.OrganizationID, o.ID, OpCancel, nil)
 	if errors.Is(err, ErrInvalidTransition) {
 		return Order{}, apperr.Conflict("el pedido ya no se puede cancelar en su estado actual")
 	}
@@ -154,7 +177,7 @@ func (s *Service) RetryPayment(ctx context.Context, actor identity.Principal, id
 	if err != nil {
 		return Order{}, err
 	}
-	out, err := s.repo.Transition(ctx, o.OrganizationID, o.ID, OpRetryPayment, false)
+	out, err := s.repo.Transition(ctx, o.OrganizationID, o.ID, OpRetryPayment, nil)
 	if errors.Is(err, ErrInvalidTransition) {
 		return Order{}, apperr.Conflict("el pedido no tiene un pago fallido que reintentar")
 	}
@@ -209,11 +232,11 @@ func (s *Service) RemovePromotion(ctx context.Context, actor identity.Principal,
 // (internal/payments), no un usuario: no reciben actor ni piden permiso. La pasarela se autentica
 // con la firma del webhook, no con un JWT — ver payments.Gateway.ParseWebhook.
 func (s *Service) MarkPaidByGateway(ctx context.Context, orgID, id uuid.UUID) (Order, error) {
-	return s.repo.Transition(ctx, orgID, id, OpMarkPaid, false)
+	return s.repo.Transition(ctx, orgID, id, OpMarkPaid, nil)
 }
 
 func (s *Service) MarkPaymentFailedByGateway(ctx context.Context, orgID, id uuid.UUID) (Order, error) {
-	return s.repo.Transition(ctx, orgID, id, OpMarkPaymentFailed, false)
+	return s.repo.Transition(ctx, orgID, id, OpMarkPaymentFailed, nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -248,7 +271,7 @@ func (s *Service) transitionForOrg(ctx context.Context, actor identity.Principal
 	if _, err := s.gate.Open(ctx, actor, orgID, access.OrgOrdersManage, true); err != nil {
 		return Order{}, err
 	}
-	out, err := s.repo.Transition(ctx, orgID, id, op, false)
+	out, err := s.repo.Transition(ctx, orgID, id, op, nil)
 	switch {
 	case errors.Is(err, ErrNotFound):
 		return Order{}, apperr.NotFound("pedido no encontrado")

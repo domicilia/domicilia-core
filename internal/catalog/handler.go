@@ -167,6 +167,7 @@ type createProductRequest struct {
 	ModifierGroupIDs []uuid.UUID      `json:"modifier_group_ids"`
 	Ingredients      []string         `json:"ingredients"`
 	Channels         []string         `json:"channels"`
+	PromoDiscountBps int32            `json:"promo_discount_bps"`
 }
 
 type updateProductRequest struct {
@@ -180,6 +181,7 @@ type updateProductRequest struct {
 	ModifierGroupIDs *[]uuid.UUID                `json:"modifier_group_ids"`
 	Ingredients      *[]string                   `json:"ingredients"`
 	Channels         *[]string                   `json:"channels"`
+	PromoDiscountBps *int32                      `json:"promo_discount_bps"`
 }
 
 func (h *Handler) listProducts(c *echo.Context) error {
@@ -216,7 +218,7 @@ func (h *Handler) createProduct(c *echo.Context) error {
 	out, err := h.svc.CreateProduct(c.Request().Context(), p, org, CreateProductInput{
 		CategoryID: in.CategoryID, Name: in.Name, Description: in.Description, ImageURL: in.ImageURL,
 		Position: in.Position, Variants: toVariantInputs(in.Variants), ModifierGroupIDs: in.ModifierGroupIDs,
-		Ingredients: in.Ingredients, Channels: in.Channels,
+		Ingredients: in.Ingredients, Channels: in.Channels, PromoDiscountBps: in.PromoDiscountBps,
 	})
 	if err != nil {
 		return err
@@ -256,7 +258,7 @@ func (h *Handler) updateProduct(c *echo.Context) error {
 	upd := UpdateProductInput{
 		CategoryID: in.CategoryID, Name: in.Name, Description: in.Description, ImageURL: in.ImageURL,
 		Position: in.Position, IsActive: in.IsActive, ModifierGroupIDs: in.ModifierGroupIDs,
-		Ingredients: in.Ingredients, Channels: in.Channels,
+		Ingredients: in.Ingredients, Channels: in.Channels, PromoDiscountBps: in.PromoDiscountBps,
 	}
 	if in.Variants != nil {
 		v := toVariantInputs(*in.Variants)

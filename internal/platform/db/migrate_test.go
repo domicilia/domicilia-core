@@ -161,12 +161,20 @@ func TestDownRevierteEnDesarrolloYSeNiegaEnProduccion(t *testing.T) {
 		t.Fatal("el down rechazado borró tablas de todos modos")
 	}
 
-	// down revierte UNA migración: la más reciente (00009). Las anteriores siguen.
+	// down revierte UNA migración: la más reciente (00010). Las anteriores siguen.
 	if _, err := migrate(url, "down", false); err != nil {
 		t.Fatalf("down en desarrollo: %v", err)
 	}
+	if tableExists(t, conn, "pricing_settings") || columnExists(t, conn, "products", "promo_discount_bps") ||
+		!columnExists(t, conn, "products", "channels") {
+		t.Fatal("el primer down debía revertir solo 00010_pricing")
+	}
+	// El segundo revierte 00009_product_channels.
+	if _, err := migrate(url, "down", false); err != nil {
+		t.Fatalf("down de 00009: %v", err)
+	}
 	if columnExists(t, conn, "products", "channels") || !tableExists(t, conn, "promotions") {
-		t.Fatal("el primer down debía revertir solo 00009_product_channels")
+		t.Fatal("el segundo down debía revertir solo 00009_product_channels")
 	}
 	// El segundo revierte 00008_promotions.
 	if _, err := migrate(url, "down", false); err != nil {
@@ -276,14 +284,14 @@ func TestAdoptaLaBaseDeAlembicSinEjecutarSuSQL(t *testing.T) {
 	if err := conn.QueryRow(context.Background(), `SELECT count(*) FROM organizations`).Scan(&n); err != nil || n != 1 {
 		t.Fatalf("organizaciones = %d, %v: adopt no debe tocar los datos", n, err)
 	}
-	// Tras adoptar la base queda pendiente lo que vino después (00002 a 00009), y NO la base.
+	// Tras adoptar la base queda pendiente lo que vino después (00002 a 00010), y NO la base.
 	out, err = migrate(url, "up", true)
 	if err != nil || !strings.Contains(out, "00002_rbac.sql") || !strings.Contains(out, "00003_organizations_lifecycle.sql") ||
 		!strings.Contains(out, "00004_whatsapp_inbox.sql") || !strings.Contains(out, "00005_catalog.sql") ||
 		!strings.Contains(out, "00006_orders.sql") || !strings.Contains(out, "00007_payments.sql") ||
 		!strings.Contains(out, "00008_promotions.sql") || !strings.Contains(out, "00009_product_channels.sql") ||
-		strings.Contains(out, "00001_baseline.sql") {
-		t.Fatalf("tras adoptar debía aplicarse 00002 a 00009, no la base: %q, %v", out, err)
+		!strings.Contains(out, "00010_pricing.sql") || strings.Contains(out, "00001_baseline.sql") {
+		t.Fatalf("tras adoptar debía aplicarse 00002 a 00010, no la base: %q, %v", out, err)
 	}
 	if err := conn.QueryRow(context.Background(), `SELECT count(*) FROM organizations`).Scan(&n); err != nil || n != 1 {
 		t.Fatalf("organizaciones = %d, %v: los datos deben sobrevivir a la migración", n, err)
