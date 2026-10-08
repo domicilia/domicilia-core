@@ -47,18 +47,21 @@ func TestValidateSlug(t *testing.T) {
 		}
 	}
 	invalid := map[string]string{
-		"corto":             "ab",
-		"largo":             strings.Repeat("a", maxSlug+1),
-		"mayúsculas":        "Acme",
-		"espacio":           "mi tienda",
-		"acento":            "café",
-		"guion inicial":     "-acme",
-		"guion final":       "acme-",
-		"guiones repetidos": "mi--tienda",
-		"guion bajo":        "mi_tienda",
-		"reservado":         "platform",
-		"reservado (api)":   "api",
-		"reservado (v1)":    "v1",
+		"corto":                  "ab",
+		"largo":                  strings.Repeat("a", maxSlug+1),
+		"mayúsculas":             "Acme",
+		"espacio":                "mi tienda",
+		"acento":                 "café",
+		"guion inicial":          "-acme",
+		"guion final":            "acme-",
+		"guiones repetidos":      "mi--tienda",
+		"guion bajo":             "mi_tienda",
+		"reservado":              "platform",
+		"reservado (api)":        "api",
+		"reservado (v1)":         "v1",
+		"reservado (privacidad)": "privacidad",
+		"reservado (terminos)":   "terminos",
+		"reservado (pagar)":      "pagar",
 	}
 	for name, s := range invalid {
 		if err := ValidateSlug(s); err == nil {

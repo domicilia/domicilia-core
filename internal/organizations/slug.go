@@ -24,6 +24,8 @@ var reservedSlugs = map[string]struct{}{
 	"pagos": {}, "errores": {}, "recuperar": {}, "cuenta": {},
 	"admin": {}, "www": {}, "app": {}, "static": {}, "public": {}, "v1": {}, "webhooks": {},
 	"healthz": {}, "readyz": {}, "docs": {}, "support": {}, "soporte": {},
+	// Páginas legales del frontend y link de cobro de WhatsApp (/pagar/{token}, docs/pagos.md).
+	"privacidad": {}, "terminos": {}, "pagar": {},
 }
 
 // fold quita los acentos del español y del portugués.
