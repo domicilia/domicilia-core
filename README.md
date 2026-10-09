@@ -390,9 +390,10 @@ no lo detecta.
 - Cobro (ePayco): `organization_subscriptions` deja el sitio; no existe el cobro.
 - Puerta de servicio para el agente de IA (credenciales de servicio, no el JWT de un
   usuario): se diseña cuando exista la primera *tool*.
-- Renombrar en **GitHub** `domicilia-api` a `domicilia-agent` (repo, imagen de GHCR, workflows y
-  credenciales) cuando producción lleve estable unos días. La carpeta local ya se llama
-  `domicilia-agent`; el remoto todavía apunta a `domicilia-api`.
+- ~~Renombrar en GitHub `domicilia-api` a `domicilia-agent`~~ — **hecho el 2026-10-09**: repo
+  renombrado (GitHub redirige el nombre viejo), workflows de despliegue desactivados (ese servicio
+  ya no existe en la VM) y credenciales federadas de Azure del nombre viejo eliminadas. Queda la
+  imagen vieja `ghcr.io/domicilia/domicilia-api` en GHCR, sin uso; se borra desde la web de GitHub.
 - Frontend: `mapApiUserToSession` trata todo rol de organización que no sea `admin` como
   `callcenter`, y un usuario con solo un rol de plataforma a medida como `customer`. Con
   roles personalizados conviene decidir la sesión por permisos (`/v1/users/me` ya los trae).
